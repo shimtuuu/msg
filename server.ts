@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import http from 'http';
 import path from 'path';
@@ -6,8 +7,6 @@ import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
-  decryptMessage,
-  encryptMessage,
   establishSessionAsResponder,
   extractPublicPreKeyBundle,
   generateIdentityBundle,
@@ -18,8 +17,6 @@ import {
 } from './src/crypto/signalEngine.ts';
 import {
   createSenderKeyState,
-  decryptGroupMessage,
-  encryptGroupMessage,
   exportSenderKeyDistribution,
   importSenderKeyDistribution,
   unwrapSenderKeyFromPeer,
@@ -29,6 +26,9 @@ import {
 } from './src/crypto/senderKey.ts';
 import {
   canAccessAdminPanel,
+  canAccessManagementConsole,
+  canCreateAccounts,
+  canCreateAccountWithRole,
   canCreateChannels,
   canManageChannels,
   canManageSecurityPolicies,
@@ -39,12 +39,39 @@ import {
   type EnterpriseRole,
   type EnterpriseUserRecord,
 } from './src/utils/enterpriseAdmin.ts';
-import type { ChannelCategory } from './src/types/messenger.ts';
+import {
+  isValidCorporateEmail,
+  normalizeEmail,
+  validateLoginInput,
+} from './src/utils/authValidation.ts';
+import {
+  extractBearerOrCookieToken,
+  hashPassword,
+  SESSION_COOKIE_NAME,
+  signSessionToken,
+  verifyPassword,
+  verifySessionToken,
+} from './src/utils/serverAuth.ts';
+import {
+  loadAuthStore,
+  saveAuthStore,
+  type PersistedAccountRecord,
+} from './src/utils/authStore.ts';
+import {
+  enqueueInboxPacket,
+  loadChatStore,
+  saveChatStore,
+  upsertVaultRecord,
+  type PendingInboxPacket,
+  type PersistedRoomRecord,
+} from './src/utils/chatStore.ts';
+import type { EncryptedVaultRecord } from './src/crypto/vaultCrypto.ts';
+import type { AuthUser, ChannelCategory } from './src/types/messenger.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-interface ServerPeerAgent {
+interface ServerAccount {
   id: string;
   name: string;
   email: string;
@@ -53,8 +80,8 @@ interface ServerPeerAgent {
   enterpriseRole: EnterpriseRole;
   isActive: boolean;
   keysVerified: boolean;
-  isInteractiveAgent: boolean;
   presence: 'online' | 'away' | 'dnd' | 'offline';
+  passwordHash: string;
   bundle: IdentityBundle;
   dmSessions: Map<string, RatchetSession>;
   roomSelfKeys: Map<string, SenderKeyState>;
@@ -77,6 +104,12 @@ interface ConnectedClient {
   lastActiveAt: number;
 }
 
+interface ActiveSession {
+  sid: string;
+  uid: string;
+  exp: number;
+}
+
 interface ServerRoom {
   id: string;
   name: string;
@@ -91,7 +124,7 @@ interface ServerRoom {
   senderKeyGeneration: number;
 }
 
-const PEER_BLUEPRINTS: Array<{
+const INITIAL_ACCOUNTS: Array<{
   id: string;
   name: string;
   email: string;
@@ -100,18 +133,18 @@ const PEER_BLUEPRINTS: Array<{
   enterpriseRole: EnterpriseRole;
   presence: 'online' | 'away' | 'dnd' | 'offline';
   keysVerified: boolean;
-  isInteractiveAgent: boolean;
+  password: string;
 }> = [
   {
-    id: 'peer-echo',
-    name: 'Signal Echo Node',
-    email: 'echo-node@corp.internal',
-    department: 'Информационная безопасность',
-    title: 'Крипто-верификатор E2EE',
-    enterpriseRole: 'security_officer',
+    id: 'emp-admin',
+    name: 'Александр Морозов',
+    email: 'admin@corp.internal',
+    department: 'Руководство и ИТ',
+    title: 'Системный администратор',
+    enterpriseRole: 'owner',
     presence: 'online',
     keysVerified: true,
-    isInteractiveAgent: true,
+    password: process.env.CORP_ADMIN_PASSWORD || 'AdminCorp!2026',
   },
   {
     id: 'peer-elena',
@@ -122,7 +155,7 @@ const PEER_BLUEPRINTS: Array<{
     enterpriseRole: 'security_officer',
     presence: 'online',
     keysVerified: true,
-    isInteractiveAgent: true,
+    password: 'SecOfficer!2026',
   },
   {
     id: 'peer-marcus',
@@ -133,7 +166,7 @@ const PEER_BLUEPRINTS: Array<{
     enterpriseRole: 'admin',
     presence: 'online',
     keysVerified: true,
-    isInteractiveAgent: true,
+    password: 'VolkovAdmin!2026',
   },
   {
     id: 'emp-alexey',
@@ -144,7 +177,7 @@ const PEER_BLUEPRINTS: Array<{
     enterpriseRole: 'member',
     presence: 'away',
     keysVerified: true,
-    isInteractiveAgent: false,
+    password: 'PetrovWork!2026',
   },
   {
     id: 'emp-anna',
@@ -155,7 +188,7 @@ const PEER_BLUEPRINTS: Array<{
     enterpriseRole: 'moderator',
     presence: 'online',
     keysVerified: true,
-    isInteractiveAgent: false,
+    password: 'SmirnovaMod!2026',
   },
   {
     id: 'emp-dmitry',
@@ -166,7 +199,7 @@ const PEER_BLUEPRINTS: Array<{
     enterpriseRole: 'guest',
     presence: 'offline',
     keysVerified: false,
-    isInteractiveAgent: false,
+    password: 'GuestAudit!2026',
   },
 ];
 
@@ -193,7 +226,7 @@ const INITIAL_ROOMS: Array<{
   {
     id: 'room-general',
     name: 'general',
-    description: 'Общий корпоративный канал (Sender Keys E2EE)',
+    description: 'Общий корпоративный канал',
     topic: 'Рабочие вопросы, релизы и кросс-командная координация',
     department: 'Вся компания',
     category: 'department',
@@ -203,8 +236,8 @@ const INITIAL_ROOMS: Array<{
   {
     id: 'room-security',
     name: 'security-audit',
-    description: 'Закрытый канал ИБ, комплаенса и обмена ключами',
-    topic: 'Аудит SOC2, реагирование на инциденты и ротация SenderKeys',
+    description: 'Закрытый канал информационной безопасности и комплаенса',
+    topic: 'Аудит SOC2, реагирование на инциденты и управление ключами',
     department: 'Информационная безопасность',
     category: 'department',
     kind: 'private',
@@ -232,83 +265,52 @@ const INITIAL_ROOMS: Array<{
   },
 ];
 
-async function createPeerAgents(): Promise<Map<string, ServerPeerAgent>> {
-  const agents = new Map<string, ServerPeerAgent>();
+async function createInitialAccounts(): Promise<{
+  accounts: Map<string, ServerAccount>;
+  emailIndex: Map<string, string>;
+}> {
+  const accounts = new Map<string, ServerAccount>();
+  const emailIndex = new Map<string, string>();
   const now = Date.now();
-  for (const bp of PEER_BLUEPRINTS) {
+  for (const bp of INITIAL_ACCOUNTS) {
     const bundle = await generateIdentityBundle(bp.id);
     const roomSelfKeys = new Map<string, SenderKeyState>();
     for (const r of INITIAL_ROOMS) {
       roomSelfKeys.set(r.id, await createSenderKeyState(r.id, bp.id));
     }
-    agents.set(bp.id, {
+    const cleanEmail = normalizeEmail(bp.email);
+    accounts.set(bp.id, {
       id: bp.id,
       name: bp.name,
-      email: bp.email,
+      email: cleanEmail,
       department: bp.department,
       title: bp.title,
       enterpriseRole: bp.enterpriseRole,
       isActive: true,
       keysVerified: bp.keysVerified,
-      isInteractiveAgent: bp.isInteractiveAgent,
       presence: bp.presence,
+      passwordHash: hashPassword(bp.password),
       bundle,
       dmSessions: new Map(),
       roomSelfKeys,
       roomPeerKeys: new Map(),
       lastActiveAt: now,
     });
+    emailIndex.set(cleanEmail, bp.id);
   }
-  return agents;
+  return { accounts, emailIndex };
 }
 
-function buildDmAgentReply(
-  agentId: string,
-  incoming: string,
-  counter: number,
-  threadRootId?: string
-): string {
-  const lower = incoming.toLowerCase();
-  const threadPrefix = threadRootId ? '[Ветка треда] ' : '';
-  if (agentId === 'peer-echo') {
-    if (lower.includes('привет') || lower.includes('hello') || lower.includes('hi')) {
-      return `${threadPrefix}Привет! Расшифровано через Double Ratchet (счётчик #${counter}). Эфемерный DH-ключ обновлён.`;
-    }
-    return `${threadPrefix}E2EE подтверждено (#${counter}): «${incoming.slice(0, 72)}» расшифровано локально и перешифровано новым ключом цепи.`;
-  }
-  if (agentId === 'peer-elena') {
-    if (lower.includes('ключ') || lower.includes('safety') || lower.includes('номер')) {
-      return `${threadPrefix}Safety Number вычисляется из публичных ключей обеих сторон через SHA-512. Можешь сверить 60 цифр в окне «Безопасность».`;
-    }
-    return `${threadPrefix}Принято (Double Ratchet #${counter}). Сервер-ретранслятор видел только выровненный шифротекст AES-256-GCM.`;
-  }
-  if (agentId === 'peer-marcus') {
-    return `${threadPrefix}Получено (#${counter}). Виртуализированный MessageList удерживает O(log N) рендеринг даже при 10 000+ сообщений.`;
-  }
-  return `${threadPrefix}Принято корпоративным узлом (Double Ratchet #${counter}). Политика E2EE соблюдена.`;
-}
-
-function buildRoomAgentReply(
-  agent: ServerPeerAgent,
-  roomId: string,
-  incoming: string,
-  iteration: number,
-  threadRootId?: string
-): string {
-  const prefix = threadRootId ? `[Тред · SenderKey #${iteration}] ` : '';
-  if (roomId === 'room-security') {
-    return `${prefix || `[SenderKey #${iteration}] `}Подтверждаю: сообщение «${incoming.slice(0, 50)}» проверено подписью ECDSA и расшифровано только участниками ИБ.`;
-  }
-  if (roomId === 'room-devops') {
-    return `${prefix || `[SRE #${iteration}] `}Зафиксировано в #devops-sre. Кластеры в штатном режиме, ключ цепи синхронизирован.`;
-  }
-  if (roomId === 'room-legal') {
-    return `${prefix || `[Комплаенс #${iteration}] `}Принято в закрытом юридическом канале. Метаданные не покидают периметр.`;
-  }
-  if (agent.id === 'peer-marcus') {
-    return `${prefix}Принято в канале (итерация цепи #${iteration}). Memoized MessageRow обновил только новую строку без пересчёта списка.`;
-  }
-  return `${prefix}Канальное сообщение #${iteration} расшифровано через SenderKey AES-256-GCM.`;
+function toAuthUser(acc: ServerAccount): AuthUser {
+  return {
+    userId: acc.id,
+    name: acc.name,
+    email: acc.email,
+    department: acc.department,
+    title: acc.title,
+    role: acc.enterpriseRole,
+    isActive: acc.isActive,
+  };
 }
 
 async function startServer() {
@@ -318,21 +320,92 @@ async function startServer() {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
 
-  const peerAgents = await createPeerAgents();
+  const authStorePath = path.resolve(process.cwd(), '.data', 'auth-store.json');
+  const persistedAuth = loadAuthStore(
+    authStorePath,
+    Date.now(),
+    process.env.SESSION_SECRET
+  );
+  const sessionSecret = persistedAuth.sessionSecret;
+  const { accounts, emailIndex } = await createInitialAccounts();
+  const activeSessions = new Map<string, ActiveSession>();
+  for (const s of persistedAuth.sessions) {
+    activeSessions.set(s.sid, { sid: s.sid, uid: s.uid, exp: s.exp });
+  }
   const clients = new Map<string, ConnectedClient>();
   const rooms = new Map<string, ServerRoom>();
-  // Persist enterprise role & active flags by userId across reconnects
-  const clientOverrides = new Map<
-    string,
-    {
-      role?: EnterpriseRole;
-      isActive?: boolean;
-      department?: string;
-      title?: string;
-      email?: string;
-      name?: string;
+
+  // Hydrate persisted accounts & updated roles/statuses on top of initial directory
+  for (const p of persistedAuth.accounts) {
+    const cleanEmail = normalizeEmail(p.email);
+    const existing = accounts.get(p.id);
+    if (existing) {
+      existing.name = p.name;
+      existing.email = cleanEmail;
+      existing.department = p.department;
+      existing.title = p.title;
+      existing.enterpriseRole = p.enterpriseRole;
+      existing.isActive = p.isActive;
+      existing.keysVerified = p.keysVerified;
+      existing.presence = p.presence;
+      existing.passwordHash = p.passwordHash;
+      existing.lastActiveAt = p.lastActiveAt;
+      emailIndex.set(cleanEmail, p.id);
+    } else {
+      const bundle = await generateIdentityBundle(p.id);
+      const roomSelfKeys = new Map<string, SenderKeyState>();
+      for (const r of INITIAL_ROOMS) {
+        roomSelfKeys.set(r.id, await createSenderKeyState(r.id, p.id));
+      }
+      accounts.set(p.id, {
+        id: p.id,
+        name: p.name,
+        email: cleanEmail,
+        department: p.department,
+        title: p.title,
+        enterpriseRole: p.enterpriseRole,
+        isActive: p.isActive,
+        keysVerified: p.keysVerified,
+        presence: p.presence,
+        passwordHash: p.passwordHash,
+        bundle,
+        dmSessions: new Map(),
+        roomSelfKeys,
+        roomPeerKeys: new Map(),
+        lastActiveAt: p.lastActiveAt,
+      });
+      emailIndex.set(cleanEmail, p.id);
     }
-  >();
+  }
+
+  function persistAuthState() {
+    const now = Date.now();
+    const serializedAccounts: PersistedAccountRecord[] = Array.from(
+      accounts.values()
+    ).map((a) => ({
+      id: a.id,
+      name: a.name,
+      email: a.email,
+      department: a.department,
+      title: a.title,
+      enterpriseRole: a.enterpriseRole,
+      isActive: a.isActive,
+      keysVerified: a.keysVerified,
+      presence: a.presence,
+      passwordHash: a.passwordHash,
+      lastActiveAt: a.lastActiveAt,
+    }));
+    const serializedSessions = Array.from(activeSessions.values()).filter(
+      (s) => s.exp > now
+    );
+    saveAuthStore(authStorePath, {
+      sessionSecret,
+      accounts: serializedAccounts,
+      sessions: serializedSessions,
+    });
+  }
+
+  persistAuthState();
 
   let enterprisePolicy: EnterprisePolicy = {
     requireE2EE: true,
@@ -344,37 +417,17 @@ async function startServer() {
     maxAttachmentSizeMb: 25,
   };
 
-  let messagesTodayCount = 1284;
+  let messagesTodayCount = 0;
   const auditLogs: AuditLogItem[] = [
     {
       id: 'audit_init_1',
       action: 'policy.initialized',
       actorId: 'system',
-      actorName: 'Crypto Policy Engine',
+      actorName: 'Система безопасности',
       targetType: 'policy',
       targetId: 'enterprise-default',
-      summary: 'Применён базовый профиль Zero-Knowledge E2EE и DLP (AES-256-GCM)',
+      summary: 'Применён базовый профиль сквозного шифрования и DLP',
       timestamp: Date.now() - 3600_000 * 4,
-    },
-    {
-      id: 'audit_init_2',
-      action: 'sender_key.provisioned',
-      actorId: 'peer-elena',
-      actorName: 'Елена Соколова',
-      targetType: 'room',
-      targetId: 'room-security',
-      summary: 'Выпущены первичные ключи SenderKey для закрытого канала #security-audit',
-      timestamp: Date.now() - 3600_000 * 2,
-    },
-    {
-      id: 'audit_init_3',
-      action: 'user.keys_verified',
-      actorId: 'peer-elena',
-      actorName: 'Елена Соколова',
-      targetType: 'user',
-      targetId: 'peer-marcus',
-      summary: 'Подтверждён 60-значный Safety Number для сотрудника Марк Волков',
-      timestamp: Date.now() - 1800_000,
     },
   ];
 
@@ -393,20 +446,34 @@ async function startServer() {
     return item;
   }
 
+  const chatStorePath = path.resolve(process.cwd(), '.data', 'chat-store.json');
+  const persistedChat = loadChatStore(chatStorePath, Date.now());
+  const liveBundles = new Map<string, PublicPreKeyBundle>(
+    Object.entries(persistedChat.liveBundles)
+  );
+  const userVaults = new Map<string, EncryptedVaultRecord[]>(
+    Object.entries(persistedChat.vaults)
+  );
+  const pendingInbox = new Map<string, PendingInboxPacket[]>(
+    Object.entries(persistedChat.pendingInbox)
+  );
+
   for (const r of INITIAL_ROOMS) {
-    const initialMembers = PEER_BLUEPRINTS.filter((p) => {
-      if (r.kind === 'private') {
-        if (r.id === 'room-security') {
-          return (
-            p.enterpriseRole === 'security_officer' ||
-            p.enterpriseRole === 'admin' ||
-            p.enterpriseRole === 'owner'
-          );
+    const initialMembers = Array.from(accounts.values())
+      .filter((p) => {
+        if (r.kind === 'private') {
+          if (r.id === 'room-security') {
+            return (
+              p.enterpriseRole === 'security_officer' ||
+              p.enterpriseRole === 'admin' ||
+              p.enterpriseRole === 'owner'
+            );
+          }
+          return p.enterpriseRole !== 'guest';
         }
-        return p.enterpriseRole !== 'guest';
-      }
-      return true;
-    }).map((p) => p.id);
+        return true;
+      })
+      .map((p) => p.id);
 
     rooms.set(r.id, {
       ...r,
@@ -415,6 +482,81 @@ async function startServer() {
       senderKeyGeneration: 1,
     });
   }
+
+  for (const pr of persistedChat.rooms) {
+    const existing = rooms.get(pr.id);
+    const mergedMembers = new Set<string>(pr.memberIds);
+    if (existing && pr.kind === 'channel') {
+      for (const acc of accounts.values()) {
+        if (
+          (pr.id === 'room-announcements' || pr.id === 'room-general') &&
+          acc.isActive
+        ) {
+          mergedMembers.add(acc.id);
+        }
+      }
+    }
+    rooms.set(pr.id, {
+      id: pr.id,
+      name: pr.name,
+      description: pr.description,
+      topic: pr.topic,
+      department: pr.department,
+      category: pr.category,
+      kind: pr.kind,
+      memberIds: mergedMembers,
+      isArchived: Boolean(pr.isArchived),
+      onlyAdminsCanPost: Boolean(pr.onlyAdminsCanPost),
+      senderKeyGeneration: pr.senderKeyGeneration || 1,
+    });
+    for (const acc of accounts.values()) {
+      if (!acc.roomSelfKeys.has(pr.id)) {
+        acc.roomSelfKeys.set(pr.id, await createSenderKeyState(pr.id, acc.id));
+      }
+    }
+  }
+
+  function persistChatState() {
+    const serializedRooms: PersistedRoomRecord[] = Array.from(
+      rooms.values()
+    ).map((r) => ({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      topic: r.topic,
+      department: r.department,
+      category: r.category,
+      kind: r.kind,
+      memberIds: Array.from(r.memberIds),
+      isArchived: r.isArchived,
+      onlyAdminsCanPost: r.onlyAdminsCanPost,
+      senderKeyGeneration: r.senderKeyGeneration,
+    }));
+    saveChatStore(chatStorePath, {
+      rooms: serializedRooms,
+      liveBundles: Object.fromEntries(liveBundles.entries()),
+      vaults: Object.fromEntries(userVaults.entries()),
+      pendingInbox: Object.fromEntries(pendingInbox.entries()),
+    });
+  }
+
+  function queueInboxPayload(
+    targetUserId: string,
+    payload: Record<string, unknown>
+  ): boolean {
+    const acc = accounts.get(targetUserId);
+    if (!acc || !acc.isActive) return false;
+    const existing = pendingInbox.get(targetUserId) ?? [];
+    const packet: PendingInboxPacket = {
+      id: `pkt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      queuedAt: Date.now(),
+      payload,
+    };
+    pendingInbox.set(targetUserId, enqueueInboxPacket(existing, packet));
+    return true;
+  }
+
+  persistChatState();
 
   function getAllPublicPeers(excludeUserId?: string) {
     const list: Array<{
@@ -429,34 +571,22 @@ async function startServer() {
       bundle: PublicPreKeyBundle;
     }> = [];
 
-    for (const agent of peerAgents.values()) {
+    for (const acc of accounts.values()) {
+      if (acc.id === excludeUserId) continue;
+      const live = clients.get(acc.id);
       list.push({
-        userId: agent.id,
-        name: agent.name,
-        role: agent.title,
-        department: agent.department,
-        enterpriseRole: agent.enterpriseRole,
-        isActive: agent.isActive,
-        presence: agent.isActive ? agent.presence : 'offline',
-        isSystemPeer: agent.isInteractiveAgent,
-        bundle: extractPublicPreKeyBundle(agent.bundle),
+        userId: acc.id,
+        name: acc.name,
+        role: acc.title,
+        department: acc.department,
+        enterpriseRole: acc.enterpriseRole,
+        isActive: acc.isActive,
+        presence: acc.isActive ? (live ? live.presence : acc.presence) : 'offline',
+        isSystemPeer: false,
+        bundle: live
+          ? live.bundle
+          : liveBundles.get(acc.id) ?? extractPublicPreKeyBundle(acc.bundle),
       });
-    }
-
-    for (const client of clients.values()) {
-      if (client.userId !== excludeUserId) {
-        list.push({
-          userId: client.userId,
-          name: client.name,
-          role: client.title,
-          department: client.department,
-          enterpriseRole: client.enterpriseRole,
-          isActive: client.isActive,
-          presence: client.isActive ? client.presence : 'offline',
-          isSystemPeer: false,
-          bundle: client.bundle,
-        });
-      }
     }
 
     return list;
@@ -488,34 +618,20 @@ async function startServer() {
 
   function buildEnterpriseUsers(): EnterpriseUserRecord[] {
     const users: EnterpriseUserRecord[] = [];
-    for (const agent of peerAgents.values()) {
+    for (const acc of accounts.values()) {
+      const live = clients.get(acc.id);
       users.push({
-        userId: agent.id,
-        name: agent.name,
-        email: agent.email,
-        department: agent.department,
-        title: agent.title,
-        role: agent.enterpriseRole,
-        isActive: agent.isActive,
-        presence: agent.isActive ? agent.presence : 'offline',
-        registrationId: agent.bundle.registrationId,
-        lastActiveAt: agent.lastActiveAt,
-        keysVerified: agent.keysVerified,
-      });
-    }
-    for (const client of clients.values()) {
-      users.push({
-        userId: client.userId,
-        name: client.name,
-        email: client.email,
-        department: client.department,
-        title: client.title,
-        role: client.enterpriseRole,
-        isActive: client.isActive,
-        presence: client.isActive ? client.presence : 'offline',
-        registrationId: client.bundle.registrationId,
-        lastActiveAt: client.lastActiveAt,
-        keysVerified: client.keysVerified,
+        userId: acc.id,
+        name: acc.name,
+        email: acc.email,
+        department: acc.department,
+        title: acc.title,
+        role: acc.enterpriseRole,
+        isActive: acc.isActive,
+        presence: acc.isActive ? (live ? live.presence : acc.presence) : 'offline',
+        registrationId: live ? live.bundle.registrationId : acc.bundle.registrationId,
+        lastActiveAt: live ? live.lastActiveAt : acc.lastActiveAt,
+        keysVerified: acc.keysVerified,
       });
     }
     return users;
@@ -577,18 +693,6 @@ async function startServer() {
     }
   }
 
-  const agentReplyQueues = new Map<string, Promise<void>>();
-
-  function enqueueAgentTask(queueKey: string, task: () => Promise<void>): void {
-    const prev = agentReplyQueues.get(queueKey) ?? Promise.resolve();
-    const next = prev
-      .then(task)
-      .catch((err) => {
-        console.error(`Agent task failed (${queueKey}):`, err);
-      });
-    agentReplyQueues.set(queueKey, next);
-  }
-
   function broadcastPolicyUpdate() {
     for (const client of clients.values()) {
       if (client.ws.readyState === WebSocket.OPEN) {
@@ -606,19 +710,19 @@ async function startServer() {
     client: ConnectedClient,
     onlyRoomId?: string
   ) {
-    for (const agent of peerAgents.values()) {
-      if (!agent.isActive) continue;
+    for (const acc of accounts.values()) {
+      if (!acc.isActive || acc.id === client.userId) continue;
       for (const room of rooms.values()) {
         if (onlyRoomId && room.id !== onlyRoomId) continue;
-        let sk = agent.roomSelfKeys.get(room.id);
+        let sk = acc.roomSelfKeys.get(room.id);
         if (!sk) {
-          sk = await createSenderKeyState(room.id, agent.id);
-          agent.roomSelfKeys.set(room.id, sk);
+          sk = await createSenderKeyState(room.id, acc.id);
+          acc.roomSelfKeys.set(room.id, sk);
         }
         const dist = exportSenderKeyDistribution(sk);
         const wrapped = await wrapSenderKeyForPeer(
           dist,
-          agent.bundle,
+          acc.bundle,
           client.bundle.identityPublicB64
         );
         if (client.ws.readyState === WebSocket.OPEN) {
@@ -626,9 +730,9 @@ async function startServer() {
             JSON.stringify({
               type: 'group:senderKey',
               roomId: room.id,
-              senderId: agent.id,
+              senderId: acc.id,
               recipientId: client.userId,
-              senderIdentityPublicB64: agent.bundle.identityKey.publicKeyB64,
+              senderIdentityPublicB64: acc.bundle.identityKey.publicKeyB64,
               ivB64: wrapped.ivB64,
               wrappedB64: wrapped.wrappedB64,
             })
@@ -638,31 +742,98 @@ async function startServer() {
     }
   }
 
-  function resolveHttpActorRole(req: express.Request): EnterpriseRole | null {
-    const actorId =
-      req.header('x-user-id') ||
-      (typeof req.query?.userId === 'string' ? req.query.userId : undefined) ||
-      (typeof req.body?.actorId === 'string' ? req.body.actorId : undefined);
-    if (!actorId) return null;
-    const client = clients.get(actorId);
-    if (client) return client.enterpriseRole;
-    const agent = peerAgents.get(actorId);
-    if (agent) return agent.enterpriseRole;
-    return null;
+  const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+  function verifyAuthSession(token: string | null): {
+    account: ServerAccount;
+    session: ActiveSession;
+  } | null {
+    if (!token) return null;
+    const payload = verifySessionToken(token, sessionSecret);
+    if (!payload) return null;
+    const now = Date.now();
+    let session = activeSessions.get(payload.sid);
+    if (!session) {
+      if (payload.exp <= now) return null;
+      session = { sid: payload.sid, uid: payload.uid, exp: payload.exp };
+      activeSessions.set(payload.sid, session);
+    }
+    if (session.uid !== payload.uid || session.exp <= now) {
+      activeSessions.delete(payload.sid);
+      persistAuthState();
+      return null;
+    }
+    const account = accounts.get(payload.uid);
+    if (!account) return null;
+    // Sliding session extension when close to expiration
+    if (session.exp - now < SESSION_TTL_MS / 2) {
+      session.exp = now + SESSION_TTL_MS;
+      persistAuthState();
+    }
+    return { account, session };
+  }
+
+  function resolveHttpSession(req: express.Request) {
+    const token = extractBearerOrCookieToken({
+      authorizationHeader: req.header('authorization'),
+      cookieHeader: req.header('cookie'),
+    });
+    return verifyAuthSession(token);
+  }
+
+  function issueAuthCookieAndToken(
+    account: ServerAccount,
+    res: express.Response
+  ): { token: string; user: AuthUser } {
+    const sid = crypto.randomBytes(16).toString('hex');
+    const iat = Date.now();
+    const exp = iat + SESSION_TTL_MS;
+    activeSessions.set(sid, { sid, uid: account.id, exp });
+    persistAuthState();
+    const token = signSessionToken({ uid: account.id, sid, iat, exp }, sessionSecret);
+    res.setHeader(
+      'Set-Cookie',
+      `${SESSION_COOKIE_NAME}=${encodeURIComponent(
+        token
+      )}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`
+    );
+    return { token, user: toAuthUser(account) };
+  }
+
+  function revokeUserSessions(userId: string) {
+    let changed = false;
+    for (const [sid, sess] of activeSessions.entries()) {
+      if (sess.uid === userId) {
+        activeSessions.delete(sid);
+        changed = true;
+      }
+    }
+    if (changed) {
+      persistAuthState();
+    }
   }
 
   function requireAdminRole(
     predicate: (role: EnterpriseRole) => boolean = canAccessAdminPanel
   ): express.RequestHandler {
     return (req, res, next) => {
-      const role = resolveHttpActorRole(req);
-      if (!role || !predicate(role)) {
+      const auth = resolveHttpSession(req);
+      if (!auth) {
+        res.status(401).json({ error: 'Требуется авторизация' });
+        return;
+      }
+      if (!auth.account.isActive) {
+        res.status(403).json({ error: 'Учётная запись заблокирована администратором' });
+        return;
+      }
+      if (!predicate(auth.account.enterpriseRole)) {
         res.status(403).json({
           error:
-            'Доступ запрещён: операция доступна только администраторам и офицерам ИБ',
+            'Доступ запрещён: недостаточно прав для выполнения операции',
         });
         return;
       }
+      res.locals.authAccount = auth.account;
       next();
     };
   }
@@ -672,46 +843,158 @@ async function startServer() {
       status: 'ok',
       connectedClients: clients.size,
       rooms: rooms.size,
-      protocol: 'Signal-X3DH-DoubleRatchet-SenderKeys',
     });
   });
 
-  app.get('/api/peers', (_req, res) => {
-    res.json({ peers: getAllPublicPeers() });
+  // Authentication REST API
+  app.post('/api/auth/login', (req, res) => {
+    const { email = '', password = '' } = (req.body ?? {}) as {
+      email?: string;
+      password?: string;
+    };
+    const check = validateLoginInput(email, password);
+    if (!check.valid) {
+      res.status(400).json({ error: check.error });
+      return;
+    }
+
+    const cleanEmail = normalizeEmail(email);
+    const accountId = emailIndex.get(cleanEmail);
+    const account = accountId ? accounts.get(accountId) : undefined;
+    if (!account || !verifyPassword(password, account.passwordHash)) {
+      res.status(401).json({ error: 'Неверный корпоративный email или пароль' });
+      return;
+    }
+    if (!account.isActive) {
+      res.status(403).json({
+        error: 'Учётная запись заблокирована администратором организации',
+      });
+      return;
+    }
+
+    account.lastActiveAt = Date.now();
+    const authPayload = issueAuthCookieAndToken(account, res);
+    recordAuditLog({
+      action: 'auth.login',
+      actorId: account.id,
+      actorName: account.name,
+      targetType: 'user',
+      targetId: account.id,
+      summary: `Выполнен вход в систему (${account.email})`,
+    });
+    res.json(authPayload);
   });
 
-  app.use('/api/admin', requireAdminRole(canAccessAdminPanel));
+  app.post('/api/auth/register', (_req, res) => {
+    res.status(403).json({
+      error:
+        'Самостоятельная регистрация отключена. Создавать учётные записи могут только администраторы и модераторы.',
+    });
+  });
+
+  app.get('/api/auth/me', (req, res) => {
+    const auth = resolveHttpSession(req);
+    if (!auth) {
+      res.status(401).json({ error: 'Сессия не найдена или истекла' });
+      return;
+    }
+    if (!auth.account.isActive) {
+      res.status(403).json({
+        error: 'Учётная запись заблокирована администратором организации',
+      });
+      return;
+    }
+    res.json({ user: toAuthUser(auth.account) });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const auth = resolveHttpSession(req);
+    if (auth) {
+      activeSessions.delete(auth.session.sid);
+      persistAuthState();
+      recordAuditLog({
+        action: 'auth.logout',
+        actorId: auth.account.id,
+        actorName: auth.account.name,
+        targetType: 'user',
+        targetId: auth.account.id,
+        summary: `Выход из системы (${auth.account.email})`,
+      });
+    }
+    res.setHeader(
+      'Set-Cookie',
+      `${SESSION_COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`
+    );
+    res.json({ ok: true });
+  });
+
+  app.get('/api/peers', (req, res) => {
+    const auth = resolveHttpSession(req);
+    if (!auth) {
+      res.status(401).json({ error: 'Требуется авторизация' });
+      return;
+    }
+    res.json({ peers: getAllPublicPeers(auth.account.id) });
+  });
+
+  app.use('/api/admin', requireAdminRole(canAccessManagementConsole));
 
   // Enterprise Admin REST API
   app.get('/api/admin/overview', (_req, res) => {
-    res.json(buildAdminOverview());
+    const actor = res.locals.authAccount as ServerAccount;
+    const overview = buildAdminOverview();
+    if (!canAccessAdminPanel(actor.enterpriseRole)) {
+      overview.auditLogs = [];
+    }
+    res.json(overview);
   });
 
-  app.post('/api/admin/users', requireAdminRole(canManageUsers), async (req, res) => {
+  app.post('/api/admin/users', requireAdminRole(canCreateAccounts), async (req, res) => {
     try {
+      const actor = res.locals.authAccount as ServerAccount;
       const {
         name,
         email,
         department,
         title,
         role,
-        actorId = 'admin',
-        actorName = 'Администратор',
+        password,
       } = req.body as {
         name?: string;
         email?: string;
         department?: string;
         title?: string;
         role?: EnterpriseRole;
-        actorId?: string;
-        actorName?: string;
+        password?: string;
       };
       const cleanName = (name ?? '').trim();
-      const cleanEmail = (email ?? '').trim();
-      if (!cleanName || !cleanEmail) {
-        res.status(400).json({ error: 'Имя и корпоративный Email обязательны' });
+      const cleanEmail = normalizeEmail(email ?? '');
+      if (!cleanName || !cleanEmail || !isValidCorporateEmail(cleanEmail)) {
+        res.status(400).json({ error: 'Имя и корректный корпоративный Email обязательны' });
         return;
       }
+      if (emailIndex.has(cleanEmail)) {
+        res.status(409).json({ error: 'Сотрудник с таким Email уже существует' });
+        return;
+      }
+      if (password && password.length < 6) {
+        res.status(400).json({ error: 'Пароль должен содержать минимум 6 символов' });
+        return;
+      }
+
+      const cleanRole: EnterpriseRole = role ?? 'member';
+      if (!canCreateAccountWithRole(actor.enterpriseRole, cleanRole)) {
+        res.status(403).json({
+          error:
+            'Недостаточно прав для создания учётной записи с выбранной ролью',
+        });
+        return;
+      }
+
+      const assignedPassword =
+        password && password.length >= 6
+          ? password
+          : `Corp_${crypto.randomBytes(4).toString('hex')}`;
 
       const id = `emp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       const bundle = await generateIdentityBundle(id);
@@ -723,8 +1006,7 @@ async function startServer() {
         }
       }
 
-      const cleanRole: EnterpriseRole = role ?? 'member';
-      peerAgents.set(id, {
+      accounts.set(id, {
         id,
         name: cleanName,
         email: cleanEmail,
@@ -733,19 +1015,22 @@ async function startServer() {
         enterpriseRole: cleanRole,
         isActive: true,
         keysVerified: cleanRole !== 'guest',
-        isInteractiveAgent: false,
         presence: 'online',
+        passwordHash: hashPassword(assignedPassword),
         bundle,
         dmSessions: new Map(),
         roomSelfKeys,
         roomPeerKeys: new Map(),
         lastActiveAt: Date.now(),
       });
+      emailIndex.set(cleanEmail, id);
+      persistAuthState();
+      persistChatState();
 
       recordAuditLog({
         action: 'user.invited',
-        actorId,
-        actorName,
+        actorId: actor.id,
+        actorName: actor.name,
         targetType: 'user',
         targetId: id,
         summary: `Добавлен сотрудник ${cleanName} (${cleanEmail}), роль: ${cleanRole}`,
@@ -755,61 +1040,67 @@ async function startServer() {
       for (const c of clients.values()) {
         await sendAgentSenderKeysToClient(c);
       }
-      res.status(201).json(buildAdminOverview());
+      res.status(201).json({
+        ...buildAdminOverview(),
+        provisionedCredentials: {
+          email: cleanEmail,
+          temporaryPassword: assignedPassword,
+        },
+      });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Ошибка создания пользователя' });
     }
   });
 
   app.patch('/api/admin/users/:userId', requireAdminRole(canManageUsers), (req, res) => {
+    const actor = res.locals.authAccount as ServerAccount;
     const { userId } = req.params;
-    const { role, isActive, actorId = 'admin', actorName = 'Администратор' } =
-      req.body as {
-        role?: EnterpriseRole;
-        isActive?: boolean;
-        actorId?: string;
-        actorName?: string;
-      };
+    const { role, isActive } = req.body as {
+      role?: EnterpriseRole;
+      isActive?: boolean;
+    };
 
-    const agent = peerAgents.get(userId);
+    const account = accounts.get(userId);
     const client = clients.get(userId);
-    if (!agent && !client) {
+    if (!account && !client) {
       res.status(404).json({ error: 'Сотрудник не найден' });
       return;
     }
 
-    const targetName = agent?.name ?? client?.name ?? userId;
-    if (agent) {
-      if (role !== undefined) agent.enterpriseRole = role;
-      if (isActive !== undefined) agent.isActive = isActive;
+    const targetName = account?.name ?? client?.name ?? userId;
+    if (account) {
+      if (role !== undefined) account.enterpriseRole = role;
+      if (isActive !== undefined) {
+        account.isActive = isActive;
+        if (!isActive) {
+          revokeUserSessions(userId);
+        }
+      }
+      persistAuthState();
     }
     if (client) {
-      const prev = clientOverrides.get(userId) ?? {};
       if (role !== undefined) {
         client.enterpriseRole = role;
-        prev.role = role;
       }
       if (isActive !== undefined) {
         client.isActive = isActive;
-        prev.isActive = isActive;
-        if (client.ws.readyState === WebSocket.OPEN) {
-          client.ws.send(
-            JSON.stringify({
-              type: 'account:status',
-              isActive,
-              role: client.enterpriseRole,
-            })
-          );
-        }
       }
-      clientOverrides.set(userId, prev);
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(
+          JSON.stringify({
+            type: 'account:status',
+            isActive: client.isActive,
+            role: client.enterpriseRole,
+          })
+        );
+      }
     }
 
     if (role !== undefined) {
       recordAuditLog({
         action: 'user.role_changed',
-        actorId,
-        actorName,
+        actorId: actor.id,
+        actorName: actor.name,
         targetType: 'user',
         targetId: userId,
         summary: `Назначена роль ${role} сотруднику ${targetName}`,
@@ -818,8 +1109,8 @@ async function startServer() {
     if (isActive !== undefined) {
       recordAuditLog({
         action: isActive ? 'user.restored' : 'user.suspended',
-        actorId,
-        actorName,
+        actorId: actor.id,
+        actorName: actor.name,
         targetType: 'user',
         targetId: userId,
         summary: isActive
@@ -836,30 +1127,29 @@ async function startServer() {
     '/api/admin/users/:userId/revoke-keys',
     requireAdminRole(canManageSecurityPolicies),
     async (req, res) => {
+      const actor = res.locals.authAccount as ServerAccount;
       const { userId } = req.params;
-      const { actorId = 'admin', actorName = 'Администратор' } = (req.body ?? {}) as {
-        actorId?: string;
-        actorName?: string;
-      };
 
-      const agent = peerAgents.get(userId);
+      const account = accounts.get(userId);
       const client = clients.get(userId);
-      if (!agent && !client) {
+      if (!account && !client) {
         res.status(404).json({ error: 'Сотрудник не найден' });
         return;
       }
 
-      if (agent) {
-        agent.bundle = await generateIdentityBundle(agent.id);
-        agent.dmSessions.clear();
-        agent.roomPeerKeys.clear();
-        agent.keysVerified = false;
+      if (account) {
+        account.bundle = await generateIdentityBundle(account.id);
+        account.dmSessions.clear();
+        account.roomPeerKeys.clear();
+        account.keysVerified = false;
+        liveBundles.delete(account.id);
+        persistChatState();
         for (const room of rooms.values()) {
-          agent.roomSelfKeys.set(room.id, await createSenderKeyState(room.id, agent.id));
+          account.roomSelfKeys.set(room.id, await createSenderKeyState(room.id, account.id));
         }
       }
 
-      const targetName = agent?.name ?? client?.name ?? userId;
+      const targetName = account?.name ?? client?.name ?? userId;
       if (client) {
         client.keysVerified = false;
         if (client.ws.readyState === WebSocket.OPEN) {
@@ -869,11 +1159,11 @@ async function startServer() {
 
       recordAuditLog({
         action: 'user.keys_revoked',
-        actorId,
-        actorName,
+        actorId: actor.id,
+        actorName: actor.name,
         targetType: 'security',
         targetId: userId,
-        summary: `Отозваны ключи Identity/SignedPreKey и сброшены сессии для ${targetName}`,
+        summary: `Отозваны ключи и сброшены сессии для ${targetName}`,
       });
 
       broadcastDirectory();
@@ -885,10 +1175,9 @@ async function startServer() {
   );
 
   app.patch('/api/admin/policies', requireAdminRole(canManageSecurityPolicies), (req, res) => {
-    const { policy, actorId = 'admin', actorName = 'Администратор' } = req.body as {
+    const actor = res.locals.authAccount as ServerAccount;
+    const { policy } = req.body as {
       policy: Partial<EnterprisePolicy>;
-      actorId?: string;
-      actorName?: string;
     };
     if (!policy) {
       res.status(400).json({ error: 'Не переданы параметры политики' });
@@ -898,13 +1187,13 @@ async function startServer() {
     enterprisePolicy = {
       ...enterprisePolicy,
       ...policy,
-      requireE2EE: true, // Zero-knowledge invariant cannot be turned off in corp edition
+      requireE2EE: true,
     };
 
     recordAuditLog({
       action: 'policy.updated',
-      actorId,
-      actorName,
+      actorId: actor.id,
+      actorName: actor.name,
       targetType: 'policy',
       targetId: 'enterprise-default',
       summary: `Обновлены политики ИБ: DLP гостей=${enterprisePolicy.restrictGuestDownloads ? 'вкл' : 'выкл'}, создание каналов сотрудниками=${enterprisePolicy.allowMemberChannelCreation ? 'да' : 'нет'}, TTL=${enterprisePolicy.defaultDisappearingTtlSec}с`,
@@ -915,11 +1204,8 @@ async function startServer() {
   });
 
   app.post('/api/admin/rooms/:roomId/archive', requireAdminRole(canManageUsers), (req, res) => {
+    const actor = res.locals.authAccount as ServerAccount;
     const { roomId } = req.params;
-    const { actorId = 'admin', actorName = 'Администратор' } = (req.body ?? {}) as {
-      actorId?: string;
-      actorName?: string;
-    };
 
     const room = rooms.get(roomId);
     if (!room) {
@@ -928,10 +1214,11 @@ async function startServer() {
     }
 
     room.isArchived = !room.isArchived;
+    persistChatState();
     recordAuditLog({
       action: room.isArchived ? 'room.archived' : 'room.restored',
-      actorId,
-      actorName,
+      actorId: actor.id,
+      actorName: actor.name,
       targetType: 'room',
       targetId: roomId,
       summary: room.isArchived
@@ -946,16 +1233,13 @@ async function startServer() {
   app.post(
     '/api/admin/security/rotate-all-keys',
     requireAdminRole(canManageSecurityPolicies),
-    async (req, res) => {
-      const { actorId = 'admin', actorName = 'Администратор' } = (req.body ?? {}) as {
-        actorId?: string;
-        actorName?: string;
-      };
+    async (_req, res) => {
+      const actor = res.locals.authAccount as ServerAccount;
 
       for (const room of rooms.values()) {
         room.senderKeyGeneration += 1;
-        for (const agent of peerAgents.values()) {
-          agent.roomSelfKeys.set(room.id, await createSenderKeyState(room.id, agent.id));
+        for (const acc of accounts.values()) {
+          acc.roomSelfKeys.set(room.id, await createSenderKeyState(room.id, acc.id));
         }
       }
 
@@ -965,18 +1249,18 @@ async function startServer() {
 
       recordAuditLog({
         action: 'sender_key.rotated_all',
-        actorId,
-        actorName,
+        actorId: actor.id,
+        actorName: actor.name,
         targetType: 'security',
         targetId: 'all-rooms',
-        summary: `Выполнена принудительная ротация SenderKeys по всем ${rooms.size} каналам`,
+        summary: `Выполнена принудительная ротация ключей по всем ${rooms.size} каналам`,
       });
 
       res.json(buildAdminOverview());
     }
   );
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
     let registeredUserId: string | null = null;
     let messageQueue = Promise.resolve();
 
@@ -985,48 +1269,73 @@ async function startServer() {
         const msg = JSON.parse(raw.toString());
 
         if (msg.type === 'register') {
-          const { userId, name, bundle, presence, role } = msg as {
-            userId: string;
-            name: string;
+          const { token, bundle, presence } = msg as {
+            token?: string;
             bundle: PublicPreKeyBundle;
             presence?: 'online' | 'away' | 'dnd' | 'offline';
-            role?: EnterpriseRole;
           };
-          if (!userId || !bundle) return;
-          registeredUserId = userId;
-          const override = clientOverrides.get(userId);
-          const effectiveRole: EnterpriseRole = override?.role ?? role ?? 'member';
+          const resolvedToken = extractBearerOrCookieToken({
+            explicitToken: token,
+            cookieHeader: req.headers.cookie,
+          });
+          const auth = verifyAuthSession(resolvedToken);
+          if (!auth) {
+            ws.send(
+              JSON.stringify({
+                type: 'auth:error',
+                error: 'Сессия недействительна или истекла. Войдите снова.',
+              })
+            );
+            ws.close(4001, 'Unauthorized');
+            return;
+          }
+          const acc = auth.account;
+          if (!acc.isActive) {
+            ws.send(
+              JSON.stringify({
+                type: 'auth:error',
+                error: 'Учётная запись заблокирована администратором организации.',
+              })
+            );
+            ws.close(4003, 'Suspended');
+            return;
+          }
+          if (!bundle) return;
+
+          registeredUserId = acc.id;
+          acc.presence = presence || 'online';
+          acc.lastActiveAt = Date.now();
+
           const client: ConnectedClient = {
-            userId,
-            name: override?.name || name || userId,
-            email: override?.email || `${userId}@corp.internal`,
-            department: override?.department || 'Платформенная разработка',
-            title:
-              override?.title ||
-              (canAccessAdminPanel(effectiveRole) ? 'Руководитель / Администратор' : 'Сотрудник'),
-            enterpriseRole: effectiveRole,
-            isActive: override?.isActive ?? true,
-            keysVerified: true,
-            presence: presence || 'online',
+            userId: acc.id,
+            name: acc.name,
+            email: acc.email,
+            department: acc.department,
+            title: acc.title,
+            enterpriseRole: acc.enterpriseRole,
+            isActive: acc.isActive,
+            keysVerified: acc.keysVerified,
+            presence: acc.presence,
             ws,
             bundle,
             lastActiveAt: Date.now(),
           };
-          clients.set(userId, client);
+          clients.set(acc.id, client);
+          liveBundles.set(acc.id, bundle);
 
           for (const room of rooms.values()) {
             if (room.id === 'room-announcements' || room.id === 'room-general') {
-              room.memberIds.add(userId);
-            } else if (room.kind === 'private' && canAccessAdminPanel(effectiveRole)) {
-              room.memberIds.add(userId);
+              room.memberIds.add(acc.id);
+            } else if (room.kind === 'private' && canAccessAdminPanel(acc.enterpriseRole)) {
+              room.memberIds.add(acc.id);
             }
           }
 
           ws.send(
             JSON.stringify({
               type: 'directory:sync',
-              peers: getAllPublicPeers(userId),
-              rooms: getRoomListForClient(userId, client.enterpriseRole),
+              peers: getAllPublicPeers(acc.id),
+              rooms: getRoomListForClient(acc.id, client.enterpriseRole),
               policy: enterprisePolicy,
               selfAccount: {
                 role: client.enterpriseRole,
@@ -1034,51 +1343,76 @@ async function startServer() {
               },
             })
           );
+
+          const nowMs = Date.now();
+          const savedRecords = (userVaults.get(acc.id) ?? []).filter(
+            (r) => r.expiresAt === undefined || r.expiresAt > nowMs
+          );
+          if (savedRecords.length > 0) {
+            ws.send(
+              JSON.stringify({
+                type: 'vault:sync',
+                records: savedRecords,
+              })
+            );
+          }
+
+          const queued = pendingInbox.get(acc.id);
+          if (queued && queued.length > 0) {
+            for (const pkt of queued) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(pkt.payload));
+              }
+            }
+            pendingInbox.delete(acc.id);
+          }
+
+          persistChatState();
           await sendAgentSenderKeysToClient(client);
           broadcastDirectory();
           return;
         }
 
-        if (msg.type === 'role:switch') {
+        if (msg.type === 'vault:save') {
           if (!registeredUserId) return;
-          const client = clients.get(registeredUserId);
-          const nextRole = msg.role as EnterpriseRole;
-          if (client && nextRole) {
-            client.enterpriseRole = nextRole;
-            client.title = canAccessAdminPanel(nextRole)
-              ? 'Руководитель / Администратор'
-              : nextRole === 'guest'
-              ? 'Внешний аудитор'
-              : 'Сотрудник';
-            const prev = clientOverrides.get(registeredUserId) ?? {};
-            clientOverrides.set(registeredUserId, {
-              ...prev,
-              role: nextRole,
-              title: client.title,
-            });
-            if (canAccessAdminPanel(nextRole)) {
-              rooms.get('room-security')?.memberIds.add(registeredUserId);
-            }
-            recordAuditLog({
-              action: 'user.role_changed',
-              actorId: client.userId,
-              actorName: client.name,
-              targetType: 'user',
-              targetId: client.userId,
-              summary: `Профиль сессии переключён на роль ${nextRole}`,
-            });
-            broadcastDirectory();
+          const record = msg.record as EncryptedVaultRecord | undefined;
+          if (
+            !record ||
+            typeof record.messageId !== 'string' ||
+            typeof record.conversationId !== 'string' ||
+            typeof record.timestamp !== 'number' ||
+            typeof record.ivB64 !== 'string' ||
+            typeof record.ciphertextB64 !== 'string'
+          ) {
+            return;
           }
+          const currentVault = userVaults.get(registeredUserId) ?? [];
+          userVaults.set(
+            registeredUserId,
+            upsertVaultRecord(currentVault, record)
+          );
+          persistChatState();
           return;
         }
 
-        const senderClient = registeredUserId ? clients.get(registeredUserId) : undefined;
-        if (senderClient && !senderClient.isActive) {
+        if (!registeredUserId) {
+          ws.send(
+            JSON.stringify({
+              type: 'auth:error',
+              error: 'Требуется авторизация перед отправкой сообщений',
+            })
+          );
+          return;
+        }
+
+        const senderClient = clients.get(registeredUserId);
+        const senderAccount = accounts.get(registeredUserId);
+        if ((senderClient && !senderClient.isActive) || (senderAccount && !senderAccount.isActive)) {
           ws.send(
             JSON.stringify({
               type: 'account:status',
               isActive: false,
-              role: senderClient.enterpriseRole,
+              role: senderClient?.enterpriseRole ?? senderAccount?.enterpriseRole ?? 'member',
             })
           );
           return;
@@ -1096,7 +1430,6 @@ async function startServer() {
             category,
             kind,
             onlyAdminsCanPost,
-            creatorId,
           } = msg as {
             name: string;
             description?: string;
@@ -1105,7 +1438,6 @@ async function startServer() {
             category?: ChannelCategory;
             kind?: 'channel' | 'private';
             onlyAdminsCanPost?: boolean;
-            creatorId: string;
           };
           const cleanName = (name || '').trim().toLowerCase().replace(/\s+/g, '-');
           if (!cleanName) return;
@@ -1123,7 +1455,12 @@ async function startServer() {
             department: department?.trim() || 'Кросс-функциональная команда',
             category: resolvedCategory,
             kind: resolvedKind,
-            memberIds: new Set([creatorId, ...PEER_BLUEPRINTS.filter((p) => resolvedKind === 'channel' || p.enterpriseRole !== 'guest').map((p) => p.id)]),
+            memberIds: new Set([
+              registeredUserId,
+              ...Array.from(accounts.values())
+                .filter((p) => resolvedKind === 'channel' || p.enterpriseRole !== 'guest')
+                .map((p) => p.id),
+            ]),
             isArchived: false,
             onlyAdminsCanPost: canManageChannels(senderRole) ? Boolean(onlyAdminsCanPost) : false,
             senderKeyGeneration: 1,
@@ -1134,17 +1471,18 @@ async function startServer() {
             }
           }
           rooms.set(roomId, newRoom);
-          for (const agent of peerAgents.values()) {
-            agent.roomSelfKeys.set(
+          persistChatState();
+          for (const acc of accounts.values()) {
+            acc.roomSelfKeys.set(
               roomId,
-              await createSenderKeyState(roomId, agent.id)
+              await createSenderKeyState(roomId, acc.id)
             );
           }
 
           recordAuditLog({
             action: 'room.created',
-            actorId: creatorId,
-            actorName: senderClient?.name ?? creatorId,
+            actorId: registeredUserId,
+            actorName: senderClient?.name ?? registeredUserId,
             targetType: 'room',
             targetId: roomId,
             summary: `Создан ${newRoom.kind === 'private' ? 'закрытый' : 'корпоративный'} канал #${cleanName} (${newRoom.department})`,
@@ -1167,6 +1505,7 @@ async function startServer() {
             return;
           }
           room.memberIds.add(registeredUserId);
+          persistChatState();
           recordAuditLog({
             action: 'room.joined',
             actorId: senderClient.userId,
@@ -1187,6 +1526,7 @@ async function startServer() {
           const room = rooms.get(roomId);
           if (!room) return;
           room.memberIds.delete(registeredUserId);
+          persistChatState();
           recordAuditLog({
             action: 'room.left',
             actorId: senderClient.userId,
@@ -1240,6 +1580,7 @@ async function startServer() {
           if (Array.isArray(memberIds)) {
             room.memberIds = new Set(memberIds);
           }
+          persistChatState();
 
           recordAuditLog({
             action: 'room.updated',
@@ -1271,45 +1612,32 @@ async function startServer() {
         }
 
         if (msg.type === 'session:init') {
-          const { senderId, receiverId, senderBundle, ephemeralPublicB64 } = msg as {
+          const { receiverId } = msg as {
             senderId: string;
             receiverId: string;
             senderBundle: PublicPreKeyBundle;
             ephemeralPublicB64: string;
           };
-          const agent = peerAgents.get(receiverId);
-          if (agent) {
-            const session = await establishSessionAsResponder(
-              agent.bundle,
-              senderBundle,
-              ephemeralPublicB64
-            );
-            agent.dmSessions.set(senderId, session);
-            ws.send(
-              JSON.stringify({
-                type: 'session:ack',
-                peerId: agent.id,
-                establishedAt: Date.now(),
-              })
-            );
-            return;
-          }
           const targetClient = clients.get(receiverId);
           if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
             targetClient.ws.send(JSON.stringify(msg));
+            return;
+          }
+          if (liveBundles.has(receiverId) && queueInboxPayload(receiverId, msg)) {
+            persistChatState();
+            ws.send(
+              JSON.stringify({
+                type: 'session:ack',
+                peerId: receiverId,
+                establishedAt: Date.now(),
+              })
+            );
           }
           return;
         }
 
         if (msg.type === 'group:senderKey') {
-          const {
-            roomId,
-            senderId,
-            recipientId,
-            senderIdentityPublicB64,
-            ivB64,
-            wrappedB64,
-          } = msg as {
+          const { recipientId } = msg as {
             roomId: string;
             senderId: string;
             recipientId: string;
@@ -1318,23 +1646,14 @@ async function startServer() {
             wrappedB64: string;
           };
 
-          const agent = peerAgents.get(recipientId);
-          if (agent) {
-            const dist = await unwrapSenderKeyFromPeer(
-              { ivB64, wrappedB64 },
-              agent.bundle,
-              senderIdentityPublicB64
-            );
-            agent.roomPeerKeys.set(
-              `${roomId}:${senderId}`,
-              importSenderKeyDistribution(dist)
-            );
-            return;
-          }
-
           const targetClient = clients.get(recipientId);
           if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
             targetClient.ws.send(JSON.stringify(msg));
+            return;
+          }
+
+          if (liveBundles.has(recipientId) && queueInboxPayload(recipientId, msg)) {
+            persistChatState();
           }
           return;
         }
@@ -1360,74 +1679,25 @@ async function startServer() {
           messagesTodayCount += 1;
           if (senderClient) senderClient.lastActiveAt = Date.now();
 
-          for (const c of clients.values()) {
-            if (
-              c.userId !== envelope.senderId &&
-              room.memberIds.has(c.userId) &&
-              c.ws.readyState === WebSocket.OPEN
-            ) {
-              c.ws.send(
-                JSON.stringify({
-                  type: 'group:envelope',
-                  envelope,
-                  attachment,
-                  ephemeralTtlSec,
-                })
-              );
+          const outboundPayload = {
+            type: 'group:envelope',
+            envelope,
+            attachment,
+            ephemeralTtlSec,
+          };
+
+          let queuedOffline = false;
+          for (const memberId of room.memberIds) {
+            if (memberId === envelope.senderId) continue;
+            const c = clients.get(memberId);
+            if (c && c.ws.readyState === WebSocket.OPEN) {
+              c.ws.send(JSON.stringify(outboundPayload));
+            } else if (queueInboxPayload(memberId, outboundPayload)) {
+              queuedOffline = true;
             }
           }
-
-          const responderId =
-            envelope.roomId === 'room-announcements'
-              ? null
-              : envelope.roomId === 'room-security' || envelope.roomId === 'room-legal'
-              ? 'peer-elena'
-              : envelope.roomId === 'room-devops'
-              ? 'peer-marcus'
-              : 'peer-echo';
-          const agent = responderId ? peerAgents.get(responderId) : undefined;
-          if (agent && agent.isActive) {
-            const keyKey = `${envelope.roomId}:${envelope.senderId}`;
-            const senderState = agent.roomPeerKeys.get(keyKey);
-            if (senderState) {
-              const decrypted = await decryptGroupMessage(senderState, envelope);
-              agent.roomPeerKeys.set(keyKey, decrypted.nextState);
-
-              setTimeout(() => {
-                enqueueAgentTask(`room:${agent.id}:${envelope.roomId}`, async () => {
-                  const selfSk = agent.roomSelfKeys.get(envelope.roomId);
-                  if (!selfSk) return;
-                  const replyText = buildRoomAgentReply(
-                    agent,
-                    envelope.roomId,
-                    decrypted.plaintext,
-                    envelope.iteration,
-                    envelope.threadRootId
-                  );
-                  const encryptedReply = await encryptGroupMessage(selfSk, replyText, {
-                    replyToId: envelope.id,
-                    threadRootId: envelope.threadRootId,
-                  });
-                  agent.roomSelfKeys.set(envelope.roomId, encryptedReply.nextState);
-                  messagesTodayCount += 1;
-
-                  for (const c of clients.values()) {
-                    if (
-                      room.memberIds.has(c.userId) &&
-                      c.ws.readyState === WebSocket.OPEN
-                    ) {
-                      c.ws.send(
-                        JSON.stringify({
-                          type: 'group:envelope',
-                          envelope: encryptedReply.envelope,
-                          ephemeralTtlSec,
-                        })
-                      );
-                    }
-                  }
-                });
-              }, 260);
-            }
+          if (queuedOffline) {
+            persistChatState();
           }
           return;
         }
@@ -1441,84 +1711,16 @@ async function startServer() {
           messagesTodayCount += 1;
           if (senderClient) senderClient.lastActiveAt = Date.now();
 
-          const agent = peerAgents.get(envelope.receiverId);
-          if (agent && agent.isActive) {
-            const session = agent.dmSessions.get(envelope.senderId);
-            if (!session) return;
-
-            const decrypted = await decryptMessage(session, envelope);
-            agent.dmSessions.set(envelope.senderId, decrypted.nextSession);
-
-            ws.send(
-              JSON.stringify({
-                type: 'msg:receipt',
-                messageId: envelope.id,
-                peerId: agent.id,
-                status: 'read',
-              })
-            );
-
-            ws.send(
-              JSON.stringify({
-                type: 'typing:state',
-                conversationId: agent.id,
-                userName: agent.name,
-                isTyping: true,
-              })
-            );
-
-            setTimeout(() => {
-              enqueueAgentTask(`dm:${agent.id}:${envelope.senderId}`, async () => {
-                const currSession = agent.dmSessions.get(envelope.senderId);
-                if (!currSession || ws.readyState !== WebSocket.OPEN) return;
-                const replyText = buildDmAgentReply(
-                  agent.id,
-                  decrypted.plaintext,
-                  envelope.counter,
-                  envelope.threadRootId
-                );
-                const encryptedReply = await encryptMessage(
-                  currSession,
-                  agent.id,
-                  replyText,
-                  {
-                    threadRootId: envelope.threadRootId,
-                    replyToId: envelope.id,
-                  }
-                );
-                agent.dmSessions.set(envelope.senderId, encryptedReply.nextSession);
-                messagesTodayCount += 1;
-
-                ws.send(
-                  JSON.stringify({
-                    type: 'typing:state',
-                    conversationId: agent.id,
-                    userName: agent.name,
-                    isTyping: false,
-                  })
-                );
-                ws.send(
-                  JSON.stringify({
-                    type: 'msg:envelope',
-                    envelope: encryptedReply.envelope,
-                    ephemeralTtlSec,
-                  })
-                );
-              });
-            }, 240);
-            return;
-          }
+          const outboundPayload = {
+            type: 'msg:envelope',
+            envelope,
+            attachment,
+            ephemeralTtlSec,
+          };
 
           const targetClient = clients.get(envelope.receiverId);
           if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
-            targetClient.ws.send(
-              JSON.stringify({
-                type: 'msg:envelope',
-                envelope,
-                attachment,
-                ephemeralTtlSec,
-              })
-            );
+            targetClient.ws.send(JSON.stringify(outboundPayload));
             ws.send(
               JSON.stringify({
                 type: 'msg:receipt',
@@ -1527,6 +1729,8 @@ async function startServer() {
                 status: 'delivered',
               })
             );
+          } else if (queueInboxPayload(envelope.receiverId, outboundPayload)) {
+            persistChatState();
           }
           return;
         }
@@ -1536,10 +1740,45 @@ async function startServer() {
           msg.type === 'msg:delete' ||
           msg.type === 'msg:pin'
         ) {
-          for (const c of clients.values()) {
-            if (c.userId !== registeredUserId && c.ws.readyState === WebSocket.OPEN) {
-              c.ws.send(JSON.stringify(msg));
+          const { conversationId, kind } = msg as {
+            conversationId?: string;
+            kind?: 'dm' | 'group';
+          };
+          if (!conversationId) return;
+
+          const isDm =
+            kind === 'dm' ||
+            (!rooms.has(conversationId) && accounts.has(conversationId));
+
+          if (isDm) {
+            const targetId = conversationId;
+            const outboundPayload = {
+              ...msg,
+              conversationId: registeredUserId,
+            };
+            const targetClient = clients.get(targetId);
+            if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+              targetClient.ws.send(JSON.stringify(outboundPayload));
+            } else if (queueInboxPayload(targetId, outboundPayload)) {
+              persistChatState();
             }
+            return;
+          }
+
+          const room = rooms.get(conversationId);
+          if (!room) return;
+          let queuedOffline = false;
+          for (const memberId of room.memberIds) {
+            if (memberId === registeredUserId) continue;
+            const c = clients.get(memberId);
+            if (c && c.ws.readyState === WebSocket.OPEN) {
+              c.ws.send(JSON.stringify(msg));
+            } else if (queueInboxPayload(memberId, msg)) {
+              queuedOffline = true;
+            }
+          }
+          if (queuedOffline) {
+            persistChatState();
           }
           return;
         }
@@ -1565,38 +1804,47 @@ async function startServer() {
           if (!actorId) return;
 
           if (kind === 'dm') {
+            const outboundPayload = {
+              type: 'msg:reaction',
+              conversationId: actorId,
+              kind: 'dm',
+              messageId,
+              emoji,
+              userId: actorId,
+              action,
+            };
             const targetClient = clients.get(conversationId);
             if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
-              targetClient.ws.send(
-                JSON.stringify({
-                  type: 'msg:reaction',
-                  conversationId: actorId,
-                  kind: 'dm',
-                  messageId,
-                  emoji,
-                  userId: actorId,
-                  action,
-                })
-              );
+              targetClient.ws.send(JSON.stringify(outboundPayload));
+            } else if (queueInboxPayload(conversationId, outboundPayload)) {
+              persistChatState();
             }
             return;
           }
 
-          if (!rooms.has(conversationId)) return;
-          for (const c of clients.values()) {
-            if (c.userId !== actorId && c.ws.readyState === WebSocket.OPEN) {
-              c.ws.send(
-                JSON.stringify({
-                  type: 'msg:reaction',
-                  conversationId,
-                  kind: 'group',
-                  messageId,
-                  emoji,
-                  userId: actorId,
-                  action,
-                })
-              );
+          const room = rooms.get(conversationId);
+          if (!room) return;
+          const outboundPayload = {
+            type: 'msg:reaction',
+            conversationId,
+            kind: 'group',
+            messageId,
+            emoji,
+            userId: actorId,
+            action,
+          };
+          let queuedOffline = false;
+          for (const memberId of room.memberIds) {
+            if (memberId === actorId) continue;
+            const c = clients.get(memberId);
+            if (c && c.ws.readyState === WebSocket.OPEN) {
+              c.ws.send(JSON.stringify(outboundPayload));
+            } else if (queueInboxPayload(memberId, outboundPayload)) {
+              queuedOffline = true;
             }
+          }
+          if (queuedOffline) {
+            persistChatState();
           }
           return;
         }
@@ -1610,7 +1858,7 @@ async function startServer() {
     });
 
     ws.on('close', () => {
-      if (registeredUserId) {
+      if (registeredUserId && clients.get(registeredUserId)?.ws === ws) {
         clients.delete(registeredUserId);
         broadcastDirectory();
       }

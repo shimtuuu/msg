@@ -54,6 +54,31 @@ export function canAccessAdminPanel(role: EnterpriseRole): boolean {
   return role === 'owner' || role === 'admin' || role === 'security_officer';
 }
 
+export function canCreateAccounts(role: EnterpriseRole): boolean {
+  return role === 'owner' || role === 'admin' || role === 'moderator';
+}
+
+export function canAccessManagementConsole(role: EnterpriseRole): boolean {
+  return canAccessAdminPanel(role) || canCreateAccounts(role);
+}
+
+export function getCreatableRoles(actorRole: EnterpriseRole): EnterpriseRole[] {
+  if (actorRole === 'owner' || actorRole === 'admin') {
+    return ['owner', 'admin', 'security_officer', 'moderator', 'member', 'guest'];
+  }
+  if (actorRole === 'moderator') {
+    return ['member', 'guest'];
+  }
+  return [];
+}
+
+export function canCreateAccountWithRole(
+  actorRole: EnterpriseRole,
+  targetRole: EnterpriseRole
+): boolean {
+  return getCreatableRoles(actorRole).includes(targetRole);
+}
+
 export function canManageUsers(role: EnterpriseRole): boolean {
   return role === 'owner' || role === 'admin';
 }

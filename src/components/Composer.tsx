@@ -369,10 +369,10 @@ export const Composer = React.memo(function Composer({
             <div className="min-w-0 flex-1">
               <span className="text-slate-700 dark:text-slate-200 truncate block">
                 {isVoiceAttachment(pendingAttachment) ? (
-                  <>Зашифрованное голосовое сообщение (AES-GCM + HMAC) </>
+                  <>Зашифрованное голосовое сообщение </>
                 ) : (
                   <>
-                    Зашифровано (AES-GCM + HMAC):{' '}
+                    Прикреплённый файл:{' '}
                     <strong>{pendingAttachment.fileName}</strong>{' '}
                   </>
                 )}
@@ -482,7 +482,7 @@ export const Composer = React.memo(function Composer({
             onClick={handleStartRecording}
             disabled={effectiveDisabled || isEncryptingVoice || sending}
             aria-label="Записать голосовое сообщение"
-            title="Записать голосовое сообщение (MediaRecorder + E2EE)"
+            title="Записать голосовое сообщение"
             className="w-10 h-10 rounded-xl border border-slate-200 dark:border-slate-800 flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-900 disabled:opacity-40 transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
           >
             <Mic className="w-4 h-4" />
@@ -524,7 +524,7 @@ export const Composer = React.memo(function Composer({
                 ? 'Канал в архиве…'
                 : !canPost
                 ? 'Только чтение для сотрудников…'
-                : 'Сообщение (AES-256-GCM)…'
+                : 'Написать сообщение…'
             }
             className="flex-1 min-w-0 h-10 min-h-[40px] max-h-32 resize-none rounded-xl bg-slate-100/80 dark:bg-slate-900 px-3.5 py-2.5 text-sm leading-5 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 placeholder:truncate border border-transparent focus:border-blue-600 focus:bg-white dark:focus:bg-slate-950 focus:outline-none transition-colors disabled:opacity-50"
           />

@@ -20,14 +20,18 @@ import type {
   EnterpriseRole,
 } from '../types/messenger';
 import {
+  canAccessAdminPanel,
+  canCreateAccounts,
   canManageSecurityPolicies,
   canManageUsers,
   filterEnterpriseUsers,
   formatAuditLogsCsv,
+  getCreatableRoles,
   ROLE_LABELS,
 } from '../utils/enterpriseAdmin';
 
 interface AdminPanelProps {
+  authToken: string;
   localUserId: string;
   localUserName: string;
   currentUserRole: EnterpriseRole;
@@ -57,6 +61,7 @@ function formatAuditTime(ts: number): string {
 }
 
 export function AdminPanel({
+  authToken,
   localUserId,
   localUserName,
   currentUserRole,
@@ -77,6 +82,7 @@ export function AdminPanel({
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteName, setInviteName] = useState('');
   const [inviteEmail, setInviteEmail] = useState('');
+  const [invitePassword, setInvitePassword] = useState('');
   const [inviteDept, setInviteDept] = useState('Разработка');
   const [inviteTitle, setInviteTitle] = useState('Старший инженер');
   const [inviteRole, setInviteRole] = useState<EnterpriseRole>('member');
@@ -84,15 +90,26 @@ export function AdminPanel({
   // Audit filter state
   const [auditQuery, setAuditQuery] = useState('');
 
+  const allowFullAdmin = canAccessAdminPanel(currentUserRole);
+  const allowCreateAccount = canCreateAccounts(currentUserRole);
   const allowUserMgmt = canManageUsers(currentUserRole);
   const allowPolicyMgmt = canManageSecurityPolicies(currentUserRole);
+  const creatableRoles = useMemo(
+    () => getCreatableRoles(currentUserRole),
+    [currentUserRole]
+  );
+
+  const authHeaders = useMemo((): Record<string, string> => {
+    return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+  }, [authToken]);
 
   const loadOverview = useCallback(async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
       const res = await fetch('/api/admin/overview', {
-        headers: { 'x-user-id': localUserId },
+        credentials: 'include',
+        headers: authHeaders,
       });
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
@@ -106,32 +123,34 @@ export function AdminPanel({
     } finally {
       setLoading(false);
     }
-  }, [localUserId, onPolicySynced]);
+  }, [authHeaders, onPolicySynced]);
 
   useEffect(() => {
     void loadOverview();
   }, [loadOverview]);
 
-  const showNotice = (text: string) => {
+  const showNotice = (text: string, durationMs = 4000) => {
     setNoticeMsg(text);
-    window.setTimeout(() => setNoticeMsg(null), 3500);
+    window.setTimeout(() => setNoticeMsg(null), durationMs);
   };
 
   const handleInviteUser = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inviteName.trim() || !inviteEmail.trim() || !allowUserMgmt) return;
+    if (!inviteName.trim() || !inviteEmail.trim() || !allowCreateAccount) return;
     setBusyAction('invite');
     setErrorMsg(null);
     try {
       const res = await fetch('/api/admin/users', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
         body: JSON.stringify({
           name: inviteName.trim(),
           email: inviteEmail.trim(),
+          password: invitePassword.trim() || undefined,
           department: inviteDept.trim(),
           title: inviteTitle.trim(),
           role: inviteRole,
@@ -139,13 +158,24 @@ export function AdminPanel({
           actorName: localUserName,
         }),
       });
-      const data = await res.json();
+      const data = (await res.json()) as AdminOverviewPayload & {
+        error?: string;
+        provisionedCredentials?: { email: string; temporaryPassword: string };
+      };
       if (!res.ok) throw new Error(data.error || 'Ошибка создания сотрудника');
-      setOverview(data as AdminOverviewPayload);
+      setOverview(data);
       setInviteName('');
       setInviteEmail('');
+      setInvitePassword('');
       setInviteOpen(false);
-      showNotice('Сотрудник добавлен в корпоративный каталог и получил E2EE-ключи');
+      if (data.provisionedCredentials) {
+        showNotice(
+          `Сотрудник создан (${data.provisionedCredentials.email}), начальный пароль: ${data.provisionedCredentials.temporaryPassword}`,
+          8000
+        );
+      } else {
+        showNotice('Сотрудник добавлен в корпоративный каталог и получил E2EE-ключи');
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Ошибка');
     } finally {
@@ -159,14 +189,13 @@ export function AdminPanel({
     try {
       const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}`, {
         method: 'PATCH',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
         body: JSON.stringify({
           role,
-          actorId: localUserId,
-          actorName: localUserName,
         }),
       });
       const data = await res.json();
@@ -186,14 +215,13 @@ export function AdminPanel({
     try {
       const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}`, {
         method: 'PATCH',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
         body: JSON.stringify({
           isActive: nextActive,
-          actorId: localUserId,
-          actorName: localUserName,
         }),
       });
       const data = await res.json();
@@ -213,14 +241,12 @@ export function AdminPanel({
     try {
       const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/revoke-keys`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
-        body: JSON.stringify({
-          actorId: localUserId,
-          actorName: localUserName,
-        }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Ошибка отзыва ключей');
@@ -239,14 +265,12 @@ export function AdminPanel({
     try {
       const res = await fetch(`/api/admin/rooms/${encodeURIComponent(roomId)}/archive`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
-        body: JSON.stringify({
-          actorId: localUserId,
-          actorName: localUserName,
-        }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Ошибка архивирования');
@@ -265,14 +289,12 @@ export function AdminPanel({
     try {
       const res = await fetch('/api/admin/security/rotate-all-keys', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
-        body: JSON.stringify({
-          actorId: localUserId,
-          actorName: localUserName,
-        }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Ошибка ротации ключей');
@@ -291,14 +313,13 @@ export function AdminPanel({
     try {
       const res = await fetch('/api/admin/policies', {
         method: 'PATCH',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localUserId,
+          ...authHeaders,
         },
         body: JSON.stringify({
           policy: patch,
-          actorId: localUserId,
-          actorName: localUserName,
         }),
       });
       const data = (await res.json()) as AdminOverviewPayload;
@@ -468,27 +489,29 @@ export function AdminPanel({
         >
           {(
             [
-              { id: 'users', label: 'Сотрудники и RBAC' },
-              { id: 'rooms', label: 'Каналы' },
-              { id: 'policies', label: 'Политики ИБ' },
-              { id: 'audit', label: 'Журнал аудита' },
+              { id: 'users', label: 'Сотрудники и учётные записи', visible: true },
+              { id: 'rooms', label: 'Каналы', visible: true },
+              { id: 'policies', label: 'Политики ИБ', visible: allowFullAdmin },
+              { id: 'audit', label: 'Журнал аудита', visible: allowFullAdmin },
             ] as const
-          ).map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === t.id}
-              onClick={() => setActiveTab(t.id)}
-              className={`h-9 px-3.5 rounded-lg text-xs font-medium whitespace-nowrap shrink-0 ${
-                activeTab === t.id
-                  ? 'bg-blue-600 text-white'
-                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800'
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
+          )
+            .filter((t) => t.visible)
+            .map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === t.id}
+                onClick={() => setActiveTab(t.id)}
+                className={`h-9 px-3.5 rounded-lg text-xs font-medium whitespace-nowrap shrink-0 ${
+                  activeTab === t.id
+                    ? 'bg-blue-600 text-white'
+                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800'
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
         </div>
 
         {/* Tab 1: Users & RBAC */}
@@ -538,7 +561,7 @@ export function AdminPanel({
 
               <button
                 type="button"
-                disabled={!allowUserMgmt}
+                disabled={!allowCreateAccount}
                 onClick={() => setInviteOpen((v) => !v)}
                 className="h-9 px-3.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
@@ -549,14 +572,16 @@ export function AdminPanel({
 
             {!allowUserMgmt && (
               <p className="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 rounded-xl px-3.5 py-2">
-                Просмотр в режиме только для чтения. Управление учётными записями доступно ролям «Владелец» и «Администратор».
+                {allowCreateAccount
+                  ? 'Режим модератора: вы можете создавать учётные записи сотрудников и гостей. Изменение ролей и блокировка доступны администраторам.'
+                  : 'Создание учётных записей доступно только администраторам и модераторам. В вашей роли доступны политики ИБ, отзыв ключей и журнал аудита.'}
               </p>
             )}
 
-            {inviteOpen && allowUserMgmt && (
+            {inviteOpen && allowCreateAccount && (
               <form
                 onSubmit={handleInviteUser}
-                className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3"
+                className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3"
               >
                 <input
                   type="text"
@@ -575,6 +600,14 @@ export function AdminPanel({
                   className="h-9 px-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs"
                 />
                 <input
+                  type="password"
+                  minLength={6}
+                  value={invitePassword}
+                  onChange={(e) => setInvitePassword(e.target.value)}
+                  placeholder="Пароль (опционально)"
+                  className="h-9 px-3 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs"
+                />
+                <input
                   type="text"
                   value={inviteDept}
                   onChange={(e) => setInviteDept(e.target.value)}
@@ -590,11 +623,12 @@ export function AdminPanel({
                 />
                 <div className="flex items-center gap-2">
                   <select
-                    value={inviteRole}
+                    aria-label="Роль нового пользователя"
+                    value={creatableRoles.includes(inviteRole) ? inviteRole : 'member'}
                     onChange={(e) => setInviteRole(e.target.value as EnterpriseRole)}
                     className="h-9 px-2 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs flex-1 min-w-0"
                   >
-                    {ROLE_OPTIONS.map((r) => (
+                    {creatableRoles.map((r) => (
                       <option key={r} value={r}>
                         {ROLE_LABELS[r]}
                       </option>

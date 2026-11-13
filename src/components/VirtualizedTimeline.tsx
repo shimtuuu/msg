@@ -47,7 +47,6 @@ interface VirtualizedTimelineProps {
   onDelete: (messageId: string) => void;
   onTogglePin: (messageId: string) => void;
   onToggleReaction: (messageId: string, emoji: string) => void;
-  onRenderedNodesChange?: (count: number) => void;
 }
 
 function formatMessageTime(ts: number): string {
@@ -255,7 +254,7 @@ const MessageRow = React.memo(
           )}
 
           {/* Hover & popover actions */}
-          {!message.isDeleted && !isEditing && !message.isBenchmark && (
+          {!message.isDeleted && !isEditing && (
             <div
               ref={pickerContainerRef}
               className={`${
@@ -462,7 +461,7 @@ const MessageRow = React.memo(
                         </p>
                       )}
                       <p className="text-[11px] opacity-75 font-mono tabular-nums">
-                        {formatBytes(message.attachment.originalSize)} · AES-GCM + HMAC
+                        {formatBytes(message.attachment.originalSize)} · Зашифровано
                       </p>
                     </div>
                   </div>
@@ -649,7 +648,6 @@ export function VirtualizedTimeline({
   onDelete,
   onTogglePin,
   onToggleReaction,
-  onRenderedNodesChange,
 }: VirtualizedTimelineProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const measuredHeightsRef = useRef<Map<string, number>>(new Map());
@@ -740,10 +738,6 @@ export function VirtualizedTimeline({
     return messages.slice(visible.startIndex, visible.endIndex + 1);
   }, [messages, visible.startIndex, visible.endIndex]);
 
-  useEffect(() => {
-    onRenderedNodesChange?.(visibleMessages.length);
-  }, [visibleMessages.length, onRenderedNodesChange]);
-
   useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el || !stickToBottom) return;
@@ -799,7 +793,7 @@ export function VirtualizedTimeline({
               Сквозное шифрование активно
             </h2>
             <p className="mt-1.5 max-w-md text-sm text-slate-500 dark:text-slate-400">
-              Все сообщения в «{conversationName}» шифруются на клиенте перед отправкой по WebSocket. Сервер пересылает только выровненный шифротекст AES-256-GCM.
+              Все сообщения, файлы и голосовые заметки в «{conversationName}» защищены сквозным шифрованием на вашем устройстве.
             </p>
           </div>
         ) : (

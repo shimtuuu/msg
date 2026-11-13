@@ -79,7 +79,7 @@ export function ChannelDirectoryModal({
               Каталог корпоративных каналов
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Выберите каналы по департаментам или проектам для участия в E2EE-переписке
+              Выберите каналы по департаментам или проектам для общения с командой
             </p>
           </div>
           <button

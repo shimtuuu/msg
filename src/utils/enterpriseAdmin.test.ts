@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   canAccessAdminPanel,
+  canAccessManagementConsole,
+  canCreateAccounts,
+  canCreateAccountWithRole,
   canCreateChannels,
   canDownloadAttachments,
   canManageSecurityPolicies,
@@ -9,6 +12,7 @@ import {
   canPostInChannel,
   filterEnterpriseUsers,
   formatAuditLogsCsv,
+  getCreatableRoles,
   type AuditLogItem,
   type EnterprisePolicy,
   type EnterpriseUserRecord,
@@ -32,7 +36,27 @@ test('RBAC permission helpers enforce enterprise roles accurately', () => {
   assert.equal(canAccessAdminPanel('member'), false);
   assert.equal(canAccessAdminPanel('guest'), false);
 
+  assert.equal(canCreateAccounts('owner'), true);
+  assert.equal(canCreateAccounts('admin'), true);
+  assert.equal(canCreateAccounts('moderator'), true);
+  assert.equal(canCreateAccounts('security_officer'), false);
+  assert.equal(canCreateAccounts('member'), false);
+  assert.equal(canCreateAccounts('guest'), false);
+
+  assert.equal(canAccessManagementConsole('moderator'), true);
+  assert.equal(canAccessManagementConsole('member'), false);
+  assert.equal(canAccessManagementConsole('guest'), false);
+
+  assert.deepEqual(getCreatableRoles('moderator'), ['member', 'guest']);
+  assert.equal(canCreateAccountWithRole('moderator', 'member'), true);
+  assert.equal(canCreateAccountWithRole('moderator', 'guest'), true);
+  assert.equal(canCreateAccountWithRole('moderator', 'admin'), false);
+  assert.equal(canCreateAccountWithRole('moderator', 'owner'), false);
+  assert.equal(canCreateAccountWithRole('admin', 'security_officer'), true);
+  assert.equal(canCreateAccountWithRole('security_officer', 'member'), false);
+
   assert.equal(canManageUsers('admin'), true);
+  assert.equal(canManageUsers('moderator'), false);
   assert.equal(canManageUsers('security_officer'), false);
   assert.equal(canManageSecurityPolicies('security_officer'), true);
   assert.equal(canManageSecurityPolicies('member'), false);

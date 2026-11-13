@@ -106,8 +106,8 @@ export function ThreadDrawer({
             <MessageSquare className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
             <span>Тред · {conversationName}</span>
           </h2>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate">
-            E2EE · threadRootId в AES-GCM AAD
+          <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+            Сквозное шифрование · ветка обсуждения
           </p>
         </div>
         <button
@@ -147,7 +147,7 @@ export function ThreadDrawer({
               {isVoiceAttachment(rootMessage.attachment) ? (
                 <>
                   <Mic className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-                  <span className="truncate">Голосовое сообщение · AES-GCM + HMAC</span>
+                  <span className="truncate">Голосовое сообщение</span>
                 </>
               ) : (
                 <>
@@ -304,7 +304,7 @@ export function ThreadDrawer({
             placeholder={
               effectiveDisabled
                 ? 'Отправка недоступна…'
-                : 'Ответить в треде (AES-256-GCM)…'
+                : 'Ответить в треде…'
             }
             className="flex-1 min-w-0 h-10 min-h-[40px] max-h-28 resize-none rounded-xl bg-white dark:bg-slate-900 px-3 py-2 text-sm leading-5 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 border border-slate-200 dark:border-slate-800 focus:border-blue-600 focus:outline-none disabled:opacity-50"
           />

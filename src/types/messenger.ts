@@ -31,6 +31,16 @@ export type PresenceState = 'online' | 'away' | 'dnd' | 'offline';
 export type ConversationKind = 'channel' | 'private' | 'dm';
 export type ChannelCategory = 'announcement' | 'department' | 'project';
 
+export interface AuthUser {
+  userId: string;
+  name: string;
+  email: string;
+  department: string;
+  title: string;
+  role: EnterpriseRole;
+  isActive: boolean;
+}
+
 export interface PeerDirectoryItem {
   userId: string;
   name: string;
@@ -81,7 +91,6 @@ export interface ChatMessage {
   attachment?: EncryptedAttachmentPayload;
   reactions?: MessageReactions;
   expiresAt?: number;
-  isBenchmark?: boolean;
 }
 
 export interface ConversationMeta {
@@ -112,28 +121,6 @@ export interface ConversationMeta {
   disappearingTtlSec: number;
   lastMessagePreview: string;
   lastMessageAt: number;
-}
-
-export interface WireLogEntry {
-  id: string;
-  protocol: 'DoubleRatchet' | 'SenderKey';
-  direction: 'outbound' | 'inbound';
-  targetId: string;
-  counter: number;
-  keyPreview: string;
-  ivB64: string;
-  ciphertextPreview: string;
-  plaintextByteLength: number;
-  paddedByteLength: number;
-  timestamp: number;
-  threadRootId?: string;
-}
-
-export interface PerfMetrics {
-  totalMessages: number;
-  renderedDomNodes: number;
-  lastEncryptMs: number;
-  lastRenderMs: number;
 }
 
 export interface WrappedSenderKeyPacket {

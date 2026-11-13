@@ -6,8 +6,6 @@ import {
   Hash,
   Lock,
   Megaphone,
-  PanelRightClose,
-  PanelRightOpen,
   Pin,
   Search,
   Settings,
@@ -41,32 +39,46 @@ import {
   type SenderKeyState,
 } from './crypto/senderKey';
 import type { EncryptedAttachmentPayload } from './crypto/attachmentCrypto';
+import {
+  decryptVaultMessage,
+  deriveVaultKey,
+  encryptVaultMessage,
+  type EncryptedVaultRecord,
+} from './crypto/vaultCrypto';
 import type {
+  AuthUser,
   ChannelCategory,
   ChatMessage,
   ConversationMeta,
   EnterprisePolicy,
   EnterpriseRole,
   PeerDirectoryItem,
-  PerfMetrics,
   PresenceState,
   ReactionAction,
   RoomDirectoryItem,
-  WireLogEntry,
 } from './types/messenger';
 import {
-  canAccessAdminPanel,
+  canAccessManagementConsole,
   canDownloadAttachments,
   canManageChannels,
   canPostInChannel,
 } from './utils/enterpriseAdmin';
 import { applyReactionUpdate, toggleReaction } from './utils/reactions';
 import { partitionThreadMessages } from './utils/threads';
+import {
+  buildDesktopNotificationPayload,
+  getNotificationPermissionState,
+  isWindowBlurred,
+  requestDesktopNotificationPermission,
+  shouldTriggerDesktopNotification,
+  showDesktopNotification,
+  type DesktopNotificationPermission,
+} from './utils/desktopNotifications';
+import { AuthScreen } from './components/AuthScreen';
 import { Sidebar } from './components/Sidebar';
 import { VirtualizedTimeline } from './components/VirtualizedTimeline';
 import { Composer } from './components/Composer';
 import { SecurityModal } from './components/SecurityModal';
-import { InspectorDrawer } from './components/InspectorDrawer';
 import { CreateRoomModal } from './components/CreateRoomModal';
 import { AdminPanel } from './components/AdminPanel';
 import { MembersDrawer } from './components/MembersDrawer';
@@ -75,33 +87,133 @@ import { ChannelSettingsModal } from './components/ChannelSettingsModal';
 import { ThreadDrawer } from './components/ThreadDrawer';
 
 const EMPTY_MESSAGES: ChatMessage[] = [];
+const AUTH_TOKEN_KEY = 'cm_auth_token';
+const AUTH_USER_KEY = 'cm_auth_user';
+const DESKTOP_NOTIF_ENABLED_KEY = 'cm_desktop_notifications_enabled';
 
-function getOrCreateClientUserId(): string {
-  const existing = sessionStorage.getItem('cipherline_uid');
-  if (existing) return existing;
-  const uid = `user_${Math.random().toString(36).slice(2, 8)}`;
-  sessionStorage.setItem('cipherline_uid', uid);
-  return uid;
+function loadCachedAuthUser(): AuthUser | null {
+  const raw = sessionStorage.getItem(AUTH_USER_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as AuthUser;
+    if (parsed && typeof parsed.userId === 'string' && typeof parsed.email === 'string') {
+      return parsed;
+    }
+  } catch {
+    // ignore corrupted cache
+  }
+  return null;
 }
 
-function getInitialEnterpriseRole(): EnterpriseRole {
-  const params = new URLSearchParams(window.location.search);
-  const qRole = params.get('role');
-  if (
-    qRole === 'owner' ||
-    qRole === 'admin' ||
-    qRole === 'security_officer' ||
-    qRole === 'moderator' ||
-    qRole === 'member' ||
-    qRole === 'guest'
-  ) {
-    return qRole;
+async function loadOrCreateIdentityBundle(userId: string): Promise<IdentityBundle> {
+  const storageKey = `cipherline_bundle_${userId}`;
+  const rawLocal = localStorage.getItem(storageKey);
+  if (rawLocal) {
+    try {
+      const parsed = JSON.parse(rawLocal) as IdentityBundle;
+      if (parsed && parsed.userId === userId && parsed.identityKey?.publicKeyB64) {
+        return parsed;
+      }
+    } catch {
+      // fallback to sessionStorage or regenerate
+    }
   }
-  return 'member';
+  const rawSession = sessionStorage.getItem(storageKey);
+  if (rawSession) {
+    try {
+      const parsed = JSON.parse(rawSession) as IdentityBundle;
+      if (parsed && parsed.userId === userId && parsed.identityKey?.publicKeyB64) {
+        try {
+          localStorage.setItem(storageKey, rawSession);
+        } catch {
+          // ignore storage quota errors
+        }
+        return parsed;
+      }
+    } catch {
+      // regenerate corrupted bundle
+    }
+  }
+  const bundle = await generateIdentityBundle(userId);
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(bundle));
+  } catch {
+    // ignore storage quota errors
+  }
+  sessionStorage.setItem(storageKey, JSON.stringify(bundle));
+  return bundle;
+}
+
+interface PersistedRatchetState {
+  dmSessions: Record<string, RatchetSession>;
+  selfSenderKeys: Record<string, SenderKeyState>;
+  peerSenderKeys: Record<string, Record<string, SenderKeyState>>;
+}
+
+function loadRatchetState(userId: string): PersistedRatchetState {
+  const empty: PersistedRatchetState = {
+    dmSessions: {},
+    selfSenderKeys: {},
+    peerSenderKeys: {},
+  };
+  try {
+    const raw = localStorage.getItem(`cipherline_ratchet_${userId}`);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw) as Partial<PersistedRatchetState>;
+    return {
+      dmSessions: parsed.dmSessions ?? {},
+      selfSenderKeys: parsed.selfSenderKeys ?? {},
+      peerSenderKeys: parsed.peerSenderKeys ?? {},
+    };
+  } catch {
+    return empty;
+  }
+}
+
+function saveRatchetStateFromConversations(
+  userId: string,
+  convs: Record<string, ConversationMeta>
+): void {
+  const dmSessions: Record<string, RatchetSession> = {};
+  const selfSenderKeys: Record<string, SenderKeyState> = {};
+  const peerSenderKeys: Record<string, Record<string, SenderKeyState>> = {};
+  for (const conv of Object.values(convs)) {
+    if (conv.kind === 'dm' && conv.session) {
+      dmSessions[conv.id] = conv.session;
+    } else if (conv.kind !== 'dm') {
+      if (conv.selfSenderKey) {
+        selfSenderKeys[conv.id] = conv.selfSenderKey;
+      }
+      if (conv.peerSenderKeys && Object.keys(conv.peerSenderKeys).length > 0) {
+        peerSenderKeys[conv.id] = conv.peerSenderKeys;
+      }
+    }
+  }
+  try {
+    localStorage.setItem(
+      `cipherline_ratchet_${userId}`,
+      JSON.stringify({ dmSessions, selfSenderKeys, peerSenderKeys })
+    );
+  } catch {
+    // ignore quota errors
+  }
 }
 
 export default function App() {
   const [darkMode, setDarkMode] = useState(false);
+  const [authToken, setAuthToken] = useState<string | null>(() =>
+    sessionStorage.getItem(AUTH_TOKEN_KEY)
+  );
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(() =>
+    loadCachedAuthUser()
+  );
+  const [authLoading, setAuthLoading] = useState(() => !loadCachedAuthUser());
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [sessionWarning, setSessionWarning] = useState<string | null>(null);
+  const [reauthPassword, setReauthPassword] = useState('');
+  const [reauthBusy, setReauthBusy] = useState(false);
+  const [reauthError, setReauthError] = useState<string | null>(null);
+
   const [localBundle, setLocalBundle] = useState<IdentityBundle | null>(null);
   const [presence, setPresence] = useState<PresenceState>('online');
   const [wsConnected, setWsConnected] = useState(false);
@@ -113,9 +225,7 @@ export default function App() {
 
   const [mobileShowChat, setMobileShowChat] = useState(false);
   const [viewMode, setViewMode] = useState<'chat' | 'admin'>('chat');
-  const [currentUserRole, setCurrentUserRole] = useState<EnterpriseRole>(
-    getInitialEnterpriseRole
-  );
+  const [currentUserRole, setCurrentUserRole] = useState<EnterpriseRole>('member');
   const [isSuspended, setIsSuspended] = useState(false);
   const [enterprisePolicy, setEnterprisePolicy] = useState<EnterprisePolicy>({
     requireE2EE: true,
@@ -127,7 +237,6 @@ export default function App() {
     maxAttachmentSizeMb: 25,
   });
   const [securityOpen, setSecurityOpen] = useState(false);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [membersOpen, setMembersOpen] = useState(false);
   const [activeThreadRootId, setActiveThreadRootId] = useState<string | null>(null);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
@@ -137,45 +246,193 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [pinnedOpen, setPinnedOpen] = useState(false);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
-
-  const [wireLogs, setWireLogs] = useState<WireLogEntry[]>([]);
-  const [renderedDomNodes, setRenderedDomNodes] = useState(0);
-  const [lastEncryptMs, setLastEncryptMs] = useState(0);
-  const [lastRenderMs, setLastRenderMs] = useState(0);
+  const [notificationPermission, setNotificationPermission] =
+    useState<DesktopNotificationPermission>(() => getNotificationPermissionState());
+  const [desktopNotificationsEnabled, setDesktopNotificationsEnabled] = useState<boolean>(
+    () => {
+      try {
+        const stored = localStorage.getItem(DESKTOP_NOTIF_ENABLED_KEY);
+        return stored === null ? true : stored === 'true';
+      } catch {
+        return true;
+      }
+    }
+  );
 
   const wsRef = useRef<WebSocket | null>(null);
+  const authTokenRef = useRef<string | null>(authToken);
   const localBundleRef = useRef<IdentityBundle | null>(null);
+  const vaultKeyRef = useRef<CryptoKey | null>(null);
+  const pendingVaultSavesRef = useRef<EncryptedVaultRecord[]>([]);
   const conversationsRef = useRef<Record<string, ConversationMeta>>({});
   const messagesRef = useRef<Record<string, ChatMessage[]>>({});
   const activeIdRef = useRef<string>(activeId);
   const peerDirectoryRef = useRef<Record<string, PeerDirectoryItem>>({});
   const highlightTimerRef = useRef<number | null>(null);
+  const windowBlurredRef = useRef<boolean>(
+    typeof document !== 'undefined'
+      ? isWindowBlurred({
+          hasFocus: document.hasFocus(),
+          visibilityState: document.visibilityState,
+        })
+      : false
+  );
+  const presenceRef = useRef<PresenceState>(presence);
+  const notificationPermissionRef = useRef<DesktopNotificationPermission>(
+    notificationPermission
+  );
+  const notificationsEnabledRef = useRef<boolean>(desktopNotificationsEnabled);
+  const selectConversationRef = useRef<(id: string) => void>(() => {});
 
+  authTokenRef.current = authToken;
   conversationsRef.current = conversations;
   messagesRef.current = messagesByConv;
   activeIdRef.current = activeId;
+  presenceRef.current = presence;
+  notificationPermissionRef.current = notificationPermission;
+  notificationsEnabledRef.current = desktopNotificationsEnabled;
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
   useEffect(() => {
-    if (viewMode === 'admin' && !canAccessAdminPanel(currentUserRole)) {
+    const syncBlurState = () => {
+      windowBlurredRef.current = isWindowBlurred({
+        hasFocus: document.hasFocus(),
+        visibilityState: document.visibilityState,
+      });
+    };
+    const handleBlur = () => {
+      windowBlurredRef.current = true;
+    };
+    const handleFocus = () => {
+      windowBlurredRef.current = document.visibilityState === 'hidden';
+      setNotificationPermission(getNotificationPermissionState());
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        windowBlurredRef.current = true;
+      } else {
+        syncBlurState();
+      }
+    };
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (viewMode === 'admin' && !canAccessManagementConsole(currentUserRole)) {
       setViewMode('chat');
     }
   }, [viewMode, currentUserRole]);
 
+  // Verify existing session on startup without forcibly logging out an active cached session
   useEffect(() => {
     let cancelled = false;
-    const uid = getOrCreateClientUserId();
-    generateIdentityBundle(uid).then((bundle) => {
+    const storedToken = sessionStorage.getItem(AUTH_TOKEN_KEY);
+    const cachedUser = loadCachedAuthUser();
+
+    if (cachedUser) {
+      setCurrentUserRole(cachedUser.role);
+      setIsSuspended(!cachedUser.isActive);
+    }
+
+    const bootstrapSession = async () => {
+      try {
+        const res = await fetch('/api/auth/me', {
+          credentials: 'include',
+          headers: storedToken ? { Authorization: `Bearer ${storedToken}` } : undefined,
+        });
+        if (cancelled) return;
+        if (res.ok) {
+          const data = (await res.json()) as { user: AuthUser };
+          sessionStorage.setItem(AUTH_USER_KEY, JSON.stringify(data.user));
+          setCurrentUser(data.user);
+          setCurrentUserRole(data.user.role);
+          setIsSuspended(!data.user.isActive);
+          setAuthError(null);
+          setSessionWarning(null);
+        } else if (res.status === 403) {
+          const data = (await res.json().catch(() => ({}))) as { error?: string };
+          if (cachedUser) {
+            setIsSuspended(true);
+            setSessionWarning(
+              data.error || 'Учётная запись приостановлена администратором'
+            );
+          } else {
+            sessionStorage.removeItem(AUTH_TOKEN_KEY);
+            setAuthToken(null);
+            setCurrentUser(null);
+            if (data.error) setAuthError(data.error);
+          }
+        } else if (cachedUser) {
+          // Keep user inside their workspace; never force-logout on stale/invalid token
+          setSessionWarning(
+            'Сессия на сервере обновилась. Подтвердите пароль для синхронизации чатов.'
+          );
+        } else {
+          sessionStorage.removeItem(AUTH_TOKEN_KEY);
+          setAuthToken(null);
+          setCurrentUser(null);
+        }
+      } catch {
+        if (!cancelled && !cachedUser) {
+          setCurrentUser(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthLoading(false);
+        }
+      }
+    };
+
+    void bootstrapSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Load or generate per-user E2EE identity bundle once authenticated
+  useEffect(() => {
+    if (!currentUser) {
+      localBundleRef.current = null;
+      vaultKeyRef.current = null;
+      setLocalBundle(null);
+      return;
+    }
+    let cancelled = false;
+    loadOrCreateIdentityBundle(currentUser.userId).then(async (bundle) => {
+      if (cancelled) return;
+      const vKey = await deriveVaultKey(bundle);
       if (cancelled) return;
       localBundleRef.current = bundle;
+      vaultKeyRef.current = vKey;
       setLocalBundle(bundle);
     });
     return () => {
       cancelled = true;
     };
+  }, [currentUser?.userId]);
+
+  const saveMessageToVault = useCallback(async (msg: ChatMessage) => {
+    const bundle = localBundleRef.current;
+    if (!bundle) return;
+    const key = vaultKeyRef.current ?? (await deriveVaultKey(bundle));
+    vaultKeyRef.current = key;
+    const record = await encryptVaultMessage(key, msg);
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'vault:save', record }));
+    } else {
+      pendingVaultSavesRef.current.push(record);
+    }
   }, []);
 
   const distributeRoomSenderKey = useCallback(
@@ -222,10 +479,12 @@ export default function App() {
         peerMeta.bundle
       );
 
-      conversationsRef.current = {
+      const nextConvs = {
         ...conversationsRef.current,
         [peerId]: { ...peerMeta, session },
       };
+      conversationsRef.current = nextConvs;
+      saveRatchetStateFromConversations(myBundle.userId, nextConvs);
       setConversations((prev) => {
         const curr = prev[peerId];
         if (!curr) return prev;
@@ -258,6 +517,15 @@ export default function App() {
       if (!myBundle) return null;
 
       const sk = await createSenderKeyState(roomId, myBundle.userId);
+      const currConv = conversationsRef.current[roomId];
+      if (currConv) {
+        const nextConvs = {
+          ...conversationsRef.current,
+          [roomId]: { ...currConv, selfSenderKey: sk },
+        };
+        conversationsRef.current = nextConvs;
+        saveRatchetStateFromConversations(myBundle.userId, nextConvs);
+      }
       setConversations((prev) => {
         const curr = prev[roomId];
         if (!curr) return prev;
@@ -283,16 +551,21 @@ export default function App() {
 
       ws.onopen = () => {
         setWsConnected(true);
+        setSessionWarning(null);
         ws.send(
           JSON.stringify({
             type: 'register',
-            userId: localBundle.userId,
-            name: `Участник ${localBundle.userId.slice(-4).toUpperCase()}`,
+            token: authTokenRef.current ?? undefined,
             presence,
-            role: currentUserRole,
             bundle: extractPublicPreKeyBundle(localBundle),
           })
         );
+        if (pendingVaultSavesRef.current.length > 0) {
+          const toFlush = pendingVaultSavesRef.current.splice(0);
+          for (const record of toFlush) {
+            ws.send(JSON.stringify({ type: 'vault:save', record }));
+          }
+        }
       };
 
       let clientMsgQueue = Promise.resolve();
@@ -335,66 +608,79 @@ export default function App() {
               })
             );
 
-            setConversations((prev) => {
-              const next: Record<string, ConversationMeta> = {};
+            const ratchetCache = loadRatchetState(localBundle.userId);
+            const prevConvs = conversationsRef.current;
+            const syncedConvs: Record<string, ConversationMeta> = {};
 
-              for (const r of rooms) {
-                const old = prev[r.id];
-                next[r.id] = {
-                  id: r.id,
-                  kind: r.kind,
-                  name: r.name,
-                  subtitle: r.description,
-                  topic: r.topic,
-                  department: r.department,
-                  category: r.category,
-                  isArchived: r.isArchived ?? false,
-                  onlyAdminsCanPost: r.onlyAdminsCanPost ?? false,
-                  isJoined: r.isJoined ?? true,
-                  isMuted: old?.isMuted ?? false,
-                  memberIds: r.memberIds,
-                  selfSenderKey: old?.selfSenderKey,
-                  peerSenderKeys: old?.peerSenderKeys ?? {},
-                  verified: true,
-                  unreadCount: old?.unreadCount ?? 0,
-                  typingUsers: old?.typingUsers ?? [],
-                  disappearingTtlSec:
-                    old?.disappearingTtlSec ??
-                    syncedPolicy?.defaultDisappearingTtlSec ??
-                    0,
-                  lastMessagePreview: old?.lastMessagePreview ?? '',
-                  lastMessageAt: old?.lastMessageAt ?? 0,
-                };
-              }
+            for (const r of rooms) {
+              const old = prevConvs[r.id];
+              syncedConvs[r.id] = {
+                id: r.id,
+                kind: r.kind,
+                name: r.name,
+                subtitle: r.description,
+                topic: r.topic,
+                department: r.department,
+                category: r.category,
+                isArchived: r.isArchived ?? false,
+                onlyAdminsCanPost: r.onlyAdminsCanPost ?? false,
+                isJoined: r.isJoined ?? true,
+                isMuted: old?.isMuted ?? false,
+                memberIds: r.memberIds,
+                selfSenderKey:
+                  old?.selfSenderKey ?? ratchetCache.selfSenderKeys[r.id],
+                peerSenderKeys:
+                  old?.peerSenderKeys ?? ratchetCache.peerSenderKeys[r.id] ?? {},
+                verified: true,
+                unreadCount: old?.unreadCount ?? 0,
+                typingUsers: old?.typingUsers ?? [],
+                disappearingTtlSec:
+                  old?.disappearingTtlSec ??
+                  syncedPolicy?.defaultDisappearingTtlSec ??
+                  0,
+                lastMessagePreview: old?.lastMessagePreview ?? '',
+                lastMessageAt: old?.lastMessageAt ?? 0,
+              };
+            }
 
-              for (const { peer, safetyNumber } of safetyPairs) {
-                const old = prev[peer.userId];
-                next[peer.userId] = {
-                  id: peer.userId,
-                  kind: 'dm',
-                  name: peer.name,
-                  subtitle: peer.role,
-                  department: peer.department,
-                  enterpriseRole: peer.enterpriseRole,
-                  isActive: peer.isActive,
-                  presence: peer.presence,
-                  isSystemPeer: peer.isSystemPeer,
-                  bundle: peer.bundle,
-                  session: old?.session,
-                  safetyNumber,
-                  verified: old?.verified ?? false,
-                  unreadCount: old?.unreadCount ?? 0,
-                  typingUsers: old?.typingUsers ?? [],
-                  disappearingTtlSec:
-                    old?.disappearingTtlSec ??
-                    syncedPolicy?.defaultDisappearingTtlSec ??
-                    0,
-                  lastMessagePreview: old?.lastMessagePreview ?? '',
-                  lastMessageAt: old?.lastMessageAt ?? 0,
-                };
-              }
-              return next;
-            });
+            for (const { peer, safetyNumber } of safetyPairs) {
+              const old = prevConvs[peer.userId];
+              const cachedSession =
+                old?.session ?? ratchetCache.dmSessions[peer.userId];
+              const validSession =
+                cachedSession &&
+                cachedSession.remoteIdentityPublicB64 ===
+                  peer.bundle.identityPublicB64
+                  ? cachedSession
+                  : undefined;
+
+              syncedConvs[peer.userId] = {
+                id: peer.userId,
+                kind: 'dm',
+                name: peer.name,
+                subtitle: peer.role,
+                department: peer.department,
+                enterpriseRole: peer.enterpriseRole,
+                isActive: peer.isActive,
+                presence: peer.presence,
+                isSystemPeer: peer.isSystemPeer,
+                bundle: peer.bundle,
+                session: validSession,
+                safetyNumber,
+                verified: old?.verified ?? false,
+                unreadCount: old?.unreadCount ?? 0,
+                typingUsers: old?.typingUsers ?? [],
+                disappearingTtlSec:
+                  old?.disappearingTtlSec ??
+                  syncedPolicy?.defaultDisappearingTtlSec ??
+                  0,
+                lastMessagePreview: old?.lastMessagePreview ?? '',
+                lastMessageAt: old?.lastMessageAt ?? 0,
+              };
+            }
+
+            conversationsRef.current = syncedConvs;
+            setConversations(syncedConvs);
 
             const activeRoomStillAccessible = rooms.find(
               (r) => r.id === activeIdRef.current
@@ -427,17 +713,93 @@ export default function App() {
             return;
           }
 
+          if (data.type === 'vault:sync') {
+            const records = (data.records ?? []) as EncryptedVaultRecord[];
+            if (records.length === 0) return;
+            const key =
+              vaultKeyRef.current ?? (await deriveVaultKey(localBundle));
+            vaultKeyRef.current = key;
+            const decrypted = (
+              await Promise.all(
+                records.map((r) => decryptVaultMessage(key, r))
+              )
+            ).filter((m): m is ChatMessage => m !== null);
+
+            const nowMs = Date.now();
+            const valid = decrypted.filter(
+              (m) => m.expiresAt === undefined || m.expiresAt > nowMs
+            );
+            if (valid.length === 0) return;
+
+            const mergedByConv: Record<string, ChatMessage[]> = {
+              ...messagesRef.current,
+            };
+            for (const msg of valid) {
+              const list = mergedByConv[msg.conversationId] ?? [];
+              const existingIdx = list.findIndex((x) => x.id === msg.id);
+              if (existingIdx >= 0) {
+                const copy = [...list];
+                copy[existingIdx] = msg;
+                mergedByConv[msg.conversationId] = copy;
+              } else {
+                mergedByConv[msg.conversationId] = [...list, msg];
+              }
+            }
+            for (const cid of Object.keys(mergedByConv)) {
+              mergedByConv[cid] = [...mergedByConv[cid]].sort(
+                (a, b) => a.timestamp - b.timestamp
+              );
+            }
+            messagesRef.current = mergedByConv;
+            setMessagesByConv(mergedByConv);
+
+            setConversations((prev) => {
+              const next = { ...prev };
+              for (const [cid, list] of Object.entries(mergedByConv)) {
+                const conv = next[cid];
+                if (!conv || list.length === 0) continue;
+                const topLevel = list.filter((m) => !m.threadRootId);
+                const latest =
+                  topLevel[topLevel.length - 1] ?? list[list.length - 1];
+                if (latest && latest.timestamp >= conv.lastMessageAt) {
+                  next[cid] = {
+                    ...conv,
+                    lastMessagePreview: latest.text,
+                    lastMessageAt: latest.timestamp,
+                  };
+                }
+              }
+              conversationsRef.current = next;
+              return next;
+            });
+            return;
+          }
+
           if (data.type === 'session:init') {
             const { senderId, senderBundle, ephemeralPublicB64 } = data as {
               senderId: string;
               senderBundle: PublicPreKeyBundle;
               ephemeralPublicB64: string;
             };
-            const session = await establishSessionAsResponder(
-              localBundle,
-              senderBundle,
-              ephemeralPublicB64
-            );
+            let session: RatchetSession;
+            try {
+              session = await establishSessionAsResponder(
+                localBundle,
+                senderBundle,
+                ephemeralPublicB64
+              );
+            } catch {
+              return;
+            }
+            const currConv = conversationsRef.current[senderId];
+            if (currConv) {
+              const nextConvs = {
+                ...conversationsRef.current,
+                [senderId]: { ...currConv, session },
+              };
+              conversationsRef.current = nextConvs;
+              saveRatchetStateFromConversations(localBundle.userId, nextConvs);
+            }
             setConversations((prev) => {
               const curr = prev[senderId];
               if (!curr) return prev;
@@ -460,12 +822,40 @@ export default function App() {
               ivB64: string;
               wrappedB64: string;
             };
-            const dist = await unwrapSenderKeyFromPeer(
-              { ivB64, wrappedB64 },
-              localBundle,
-              senderIdentityPublicB64
-            );
-            const skState = importSenderKeyDistribution(dist);
+            let skState: SenderKeyState;
+            try {
+              const dist = await unwrapSenderKeyFromPeer(
+                { ivB64, wrappedB64 },
+                localBundle,
+                senderIdentityPublicB64
+              );
+              skState = importSenderKeyDistribution(dist);
+            } catch {
+              return;
+            }
+            const currRoom = conversationsRef.current[roomId];
+            const existingPeerKey = currRoom?.peerSenderKeys?.[senderId];
+            if (
+              existingPeerKey &&
+              existingPeerKey.keyId === skState.keyId &&
+              existingPeerKey.iteration <= skState.iteration
+            ) {
+              return;
+            }
+            if (currRoom) {
+              const nextConvs = {
+                ...conversationsRef.current,
+                [roomId]: {
+                  ...currRoom,
+                  peerSenderKeys: {
+                    ...(currRoom.peerSenderKeys ?? {}),
+                    [senderId]: skState,
+                  },
+                },
+              };
+              conversationsRef.current = nextConvs;
+              saveRatchetStateFromConversations(localBundle.userId, nextConvs);
+            }
             setConversations((prev) => {
               const curr = prev[roomId];
               if (!curr) return prev;
@@ -493,9 +883,7 @@ export default function App() {
               conversationsRef.current[roomId]?.peerSenderKeys?.[envelope.senderId];
             if (!peerSk) return;
 
-            const t0 = performance.now();
             const decrypted = await decryptGroupMessage(peerSk, envelope);
-            setLastEncryptMs(performance.now() - t0);
 
             const senderName =
               peerDirectoryRef.current[envelope.senderId]?.name ?? envelope.senderId;
@@ -528,29 +916,78 @@ export default function App() {
               expiresAt: ttlSec > 0 ? Date.now() + ttlSec * 1000 : undefined,
             };
 
-            setWireLogs((prev) => [
-              {
-                id: `in_grp_${envelope.id}`,
-                protocol: 'SenderKey',
-                direction: 'inbound',
-                targetId: roomId,
-                counter: envelope.iteration,
-                keyPreview: envelope.signatureB64.slice(0, 18),
-                ivB64: envelope.ivB64,
-                ciphertextPreview: envelope.ciphertextB64.slice(0, 44),
-                plaintextByteLength: envelope.plaintextByteLength,
-                paddedByteLength: envelope.paddedByteLength,
-                threadRootId: envelope.threadRootId,
-                timestamp: envelope.timestamp,
-              },
-              ...prev.slice(0, 49),
-            ]);
+            const currRoomBefore = conversationsRef.current[roomId];
+            const existingList = messagesRef.current[roomId] ?? [];
+            if (!existingList.some((m) => m.id === newMsg.id)) {
+              const updatedList = [...existingList, newMsg];
+              messagesRef.current = {
+                ...messagesRef.current,
+                [roomId]: updatedList,
+              };
+              setMessagesByConv((prev) => {
+                const list = prev[roomId] ?? [];
+                if (list.some((m) => m.id === newMsg.id)) return prev;
+                return { ...prev, [roomId]: [...list, newMsg] };
+              });
+              void saveMessageToVault(newMsg);
 
-            setMessagesByConv((prev) => {
-              const list = prev[roomId] ?? [];
-              if (list.some((m) => m.id === newMsg.id)) return prev;
-              return { ...prev, [roomId]: [...list, newMsg] };
-            });
+              const blurred =
+                windowBlurredRef.current ||
+                isWindowBlurred({
+                  hasFocus:
+                    typeof document !== 'undefined' ? document.hasFocus() : true,
+                  visibilityState:
+                    typeof document !== 'undefined'
+                      ? document.visibilityState
+                      : 'visible',
+                });
+              if (
+                shouldTriggerDesktopNotification({
+                  permission: notificationPermissionRef.current,
+                  enabled: notificationsEnabledRef.current,
+                  windowBlurred: blurred,
+                  isOwnMessage: newMsg.senderId === localBundle.userId,
+                  isConversationMuted: Boolean(currRoomBefore?.isMuted),
+                  presence: presenceRef.current,
+                })
+              ) {
+                const notifPayload = buildDesktopNotificationPayload({
+                  conversationId: roomId,
+                  conversationKind:
+                    currRoomBefore?.kind === 'private' ? 'private' : 'channel',
+                  conversationName: currRoomBefore?.name ?? roomId,
+                  senderName,
+                  messageId: newMsg.id,
+                  text: decrypted.plaintext,
+                  attachmentFileName: attachment?.fileName,
+                });
+                showDesktopNotification(notifPayload, (targetConvId) => {
+                  selectConversationRef.current(targetConvId);
+                });
+              }
+            }
+
+            const currRoom = conversationsRef.current[roomId];
+            if (currRoom) {
+              const isCurrent = activeIdRef.current === roomId;
+              const nextConvs = {
+                ...conversationsRef.current,
+                [roomId]: {
+                  ...currRoom,
+                  peerSenderKeys: {
+                    ...(currRoom.peerSenderKeys ?? {}),
+                    [envelope.senderId]: decrypted.nextState,
+                  },
+                  lastMessagePreview: envelope.threadRootId
+                    ? currRoom.lastMessagePreview || decrypted.plaintext
+                    : decrypted.plaintext,
+                  lastMessageAt: envelope.timestamp,
+                  unreadCount: isCurrent ? 0 : currRoom.unreadCount + 1,
+                },
+              };
+              conversationsRef.current = nextConvs;
+              saveRatchetStateFromConversations(localBundle.userId, nextConvs);
+            }
 
             setConversations((prev) => {
               const curr = prev[roomId];
@@ -584,9 +1021,7 @@ export default function App() {
             const currentSession = conversationsRef.current[peerId]?.session;
             if (!currentSession) return;
 
-            const t0 = performance.now();
             const decrypted = await decryptMessage(currentSession, envelope);
-            setLastEncryptMs(performance.now() - t0);
 
             const senderName =
               peerDirectoryRef.current[peerId]?.name ?? peerId;
@@ -619,29 +1054,74 @@ export default function App() {
               expiresAt: ttlSec > 0 ? Date.now() + ttlSec * 1000 : undefined,
             };
 
-            setWireLogs((prev) => [
-              {
-                id: `in_dm_${envelope.id}`,
-                protocol: 'DoubleRatchet',
-                direction: 'inbound',
-                targetId: peerId,
-                counter: envelope.counter,
-                keyPreview: envelope.dhPublicB64.slice(0, 18),
-                ivB64: envelope.ivB64,
-                ciphertextPreview: envelope.ciphertextB64.slice(0, 44),
-                plaintextByteLength: envelope.plaintextByteLength,
-                paddedByteLength: envelope.paddedByteLength,
-                threadRootId: envelope.threadRootId,
-                timestamp: envelope.timestamp,
-              },
-              ...prev.slice(0, 49),
-            ]);
+            const currPeerBefore = conversationsRef.current[peerId];
+            const existingList = messagesRef.current[peerId] ?? [];
+            if (!existingList.some((m) => m.id === newMessage.id)) {
+              messagesRef.current = {
+                ...messagesRef.current,
+                [peerId]: [...existingList, newMessage],
+              };
+              setMessagesByConv((prev) => {
+                const list = prev[peerId] ?? [];
+                if (list.some((m) => m.id === newMessage.id)) return prev;
+                return { ...prev, [peerId]: [...list, newMessage] };
+              });
+              void saveMessageToVault(newMessage);
 
-            setMessagesByConv((prev) => {
-              const list = prev[peerId] ?? [];
-              if (list.some((m) => m.id === newMessage.id)) return prev;
-              return { ...prev, [peerId]: [...list, newMessage] };
-            });
+              const blurred =
+                windowBlurredRef.current ||
+                isWindowBlurred({
+                  hasFocus:
+                    typeof document !== 'undefined' ? document.hasFocus() : true,
+                  visibilityState:
+                    typeof document !== 'undefined'
+                      ? document.visibilityState
+                      : 'visible',
+                });
+              if (
+                shouldTriggerDesktopNotification({
+                  permission: notificationPermissionRef.current,
+                  enabled: notificationsEnabledRef.current,
+                  windowBlurred: blurred,
+                  isOwnMessage: newMessage.senderId === localBundle.userId,
+                  isConversationMuted: Boolean(currPeerBefore?.isMuted),
+                  presence: presenceRef.current,
+                })
+              ) {
+                const notifPayload = buildDesktopNotificationPayload({
+                  conversationId: peerId,
+                  conversationKind: 'dm',
+                  conversationName: currPeerBefore?.name ?? senderName,
+                  senderName,
+                  messageId: newMessage.id,
+                  text: decrypted.plaintext,
+                  attachmentFileName: attachment?.fileName,
+                });
+                showDesktopNotification(notifPayload, (targetConvId) => {
+                  selectConversationRef.current(targetConvId);
+                });
+              }
+            }
+
+            const currPeer = conversationsRef.current[peerId];
+            if (currPeer) {
+              const isCurrent = activeIdRef.current === peerId;
+              const nextConvs = {
+                ...conversationsRef.current,
+                [peerId]: {
+                  ...currPeer,
+                  session: decrypted.nextSession,
+                  typingUsers: [],
+                  lastMessagePreview: envelope.threadRootId
+                    ? currPeer.lastMessagePreview || decrypted.plaintext
+                    : decrypted.plaintext,
+                  lastMessageAt: envelope.timestamp,
+                  unreadCount: isCurrent ? 0 : currPeer.unreadCount + 1,
+                },
+              };
+              conversationsRef.current = nextConvs;
+              saveRatchetStateFromConversations(localBundle.userId, nextConvs);
+            }
 
             setConversations((prev) => {
               const curr = prev[peerId];
@@ -690,6 +1170,15 @@ export default function App() {
               peerId: string;
               status: 'delivered' | 'read';
             };
+            const currList = messagesRef.current[peerId];
+            if (currList) {
+              const nextList = currList.map((m) =>
+                m.id === messageId ? { ...m, status } : m
+              );
+              messagesRef.current = { ...messagesRef.current, [peerId]: nextList };
+              const updated = nextList.find((m) => m.id === messageId);
+              if (updated) void saveMessageToVault(updated);
+            }
             setMessagesByConv((prev) => {
               const list = prev[peerId];
               if (!list) return prev;
@@ -703,11 +1192,56 @@ export default function App() {
             return;
           }
 
+          if (data.type === 'msg:edit') {
+            const { conversationId, messageId, text } = data as {
+              conversationId: string;
+              messageId: string;
+              text: string;
+            };
+            const currList = messagesRef.current[conversationId];
+            if (currList) {
+              const nextList = currList.map((m) =>
+                m.id === messageId ? { ...m, text, isEdited: true } : m
+              );
+              messagesRef.current = {
+                ...messagesRef.current,
+                [conversationId]: nextList,
+              };
+              const updated = nextList.find((m) => m.id === messageId);
+              if (updated) void saveMessageToVault(updated);
+            }
+            setMessagesByConv((prev) => {
+              const list = prev[conversationId];
+              if (!list) return prev;
+              return {
+                ...prev,
+                [conversationId]: list.map((m) =>
+                  m.id === messageId ? { ...m, text, isEdited: true } : m
+                ),
+              };
+            });
+            return;
+          }
+
           if (data.type === 'msg:delete') {
             const { conversationId, messageId } = data as {
               conversationId: string;
               messageId: string;
             };
+            const currList = messagesRef.current[conversationId];
+            if (currList) {
+              const nextList = currList.map((m) =>
+                m.id === messageId
+                  ? { ...m, isDeleted: true, text: 'Сообщение удалено' }
+                  : m
+              );
+              messagesRef.current = {
+                ...messagesRef.current,
+                [conversationId]: nextList,
+              };
+              const updated = nextList.find((m) => m.id === messageId);
+              if (updated) void saveMessageToVault(updated);
+            }
             setMessagesByConv((prev) => {
               const list = prev[conversationId];
               if (!list) return prev;
@@ -729,6 +1263,18 @@ export default function App() {
               messageId: string;
               isPinned: boolean;
             };
+            const currList = messagesRef.current[conversationId];
+            if (currList) {
+              const nextList = currList.map((m) =>
+                m.id === messageId ? { ...m, isPinned } : m
+              );
+              messagesRef.current = {
+                ...messagesRef.current,
+                [conversationId]: nextList,
+              };
+              const updated = nextList.find((m) => m.id === messageId);
+              if (updated) void saveMessageToVault(updated);
+            }
             setMessagesByConv((prev) => {
               const list = prev[conversationId];
               if (!list) return prev;
@@ -750,6 +1296,28 @@ export default function App() {
               userId: string;
               action: ReactionAction;
             };
+            const currList = messagesRef.current[conversationId];
+            if (currList) {
+              const nextList = currList.map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      reactions: applyReactionUpdate(
+                        m.reactions,
+                        emoji,
+                        userId,
+                        action
+                      ),
+                    }
+                  : m
+              );
+              messagesRef.current = {
+                ...messagesRef.current,
+                [conversationId]: nextList,
+              };
+              const updated = nextList.find((m) => m.id === messageId);
+              if (updated) void saveMessageToVault(updated);
+            }
             setMessagesByConv((prev) => {
               const list = prev[conversationId];
               if (!list) return prev;
@@ -781,13 +1349,34 @@ export default function App() {
             return;
           }
 
+          if (data.type === 'auth:error') {
+            // Never kick the user out of their account on invalid/expired WS token;
+            // pause WS reconnect and prompt inline reconnection instead.
+            disposed = true;
+            setSessionWarning(
+              (data.error as string) ||
+                'Сессия на сервере устарела. Подтвердите пароль, чтобы продолжить синхронизацию.'
+            );
+            setWsConnected(false);
+            ws.close();
+            return;
+          }
+
           if (data.type === 'account:status') {
             const { isActive, role } = data as {
               isActive?: boolean;
               role?: EnterpriseRole;
             };
             if (isActive !== undefined) setIsSuspended(!isActive);
-            if (role) setCurrentUserRole(role);
+            if (role) {
+              setCurrentUserRole(role);
+              setCurrentUser((prev) => {
+                if (!prev) return prev;
+                const next = { ...prev, role };
+                sessionStorage.setItem(AUTH_USER_KEY, JSON.stringify(next));
+                return next;
+              });
+            }
           }
         } catch (err) {
           console.error('WS handling error:', err);
@@ -812,7 +1401,7 @@ export default function App() {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
-  }, [localBundle, distributeRoomSenderKey, ensureDmSession, ensureRoomSenderKey]);
+  }, [localBundle, distributeRoomSenderKey, ensureDmSession, ensureRoomSenderKey, saveMessageToVault]);
 
   // Disappearing messages cleanup
   useEffect(() => {
@@ -831,7 +1420,11 @@ export default function App() {
             next[cid] = list;
           }
         }
-        return changed ? next : prev;
+        if (changed) {
+          messagesRef.current = next;
+          return next;
+        }
+        return prev;
       });
     }, 1000);
     return () => window.clearInterval(timer);
@@ -861,28 +1454,19 @@ export default function App() {
     },
     [ensureDmSession, ensureRoomSenderKey]
   );
+  selectConversationRef.current = handleSelectConversation;
 
   const handleOpenAdminPanel = useCallback(() => {
-    if (!canAccessAdminPanel(currentUserRole)) return;
+    if (!canAccessManagementConsole(currentUserRole)) return;
     setViewMode('admin');
     setMobileShowChat(true);
-    setInspectorOpen(false);
     setMembersOpen(false);
     setActiveThreadRootId(null);
   }, [currentUserRole]);
 
   const handleOpenThread = useCallback((message: ChatMessage) => {
     setActiveThreadRootId(message.id);
-    setInspectorOpen(false);
     setMembersOpen(false);
-  }, []);
-
-  const handleSwitchRole = useCallback((role: EnterpriseRole) => {
-    setCurrentUserRole(role);
-    if (!canAccessAdminPanel(role)) {
-      setViewMode('chat');
-    }
-    wsRef.current?.send(JSON.stringify({ type: 'role:switch', role }));
   }, []);
 
   const handleSendMessage = useCallback(
@@ -914,7 +1498,6 @@ export default function App() {
         const session = conv.session ?? (await ensureDmSession(convId));
         if (!session) return;
 
-        const t0 = performance.now();
         const { envelope, nextSession } = await encryptMessage(
           session,
           myBundle.userId,
@@ -924,7 +1507,6 @@ export default function App() {
             replyToId: activeReply?.id,
           }
         );
-        setLastEncryptMs(performance.now() - t0);
 
         const message: ChatMessage = {
           id: envelope.id,
@@ -948,27 +1530,8 @@ export default function App() {
           expiresAt,
         };
 
-        const renderStart = performance.now();
-        setWireLogs((prev) => [
-          {
-            id: `out_dm_${envelope.id}`,
-            protocol: 'DoubleRatchet',
-            direction: 'outbound',
-            targetId: convId,
-            counter: envelope.counter,
-            keyPreview: envelope.dhPublicB64.slice(0, 18),
-            ivB64: envelope.ivB64,
-            ciphertextPreview: envelope.ciphertextB64.slice(0, 44),
-            plaintextByteLength: envelope.plaintextByteLength,
-            paddedByteLength: envelope.paddedByteLength,
-            threadRootId: envelope.threadRootId,
-            timestamp: envelope.timestamp,
-          },
-          ...prev.slice(0, 49),
-        ]);
-
         if (conversationsRef.current[convId]) {
-          conversationsRef.current = {
+          const nextConvs = {
             ...conversationsRef.current,
             [convId]: {
               ...conversationsRef.current[convId],
@@ -979,6 +1542,8 @@ export default function App() {
               lastMessageAt: envelope.timestamp,
             },
           };
+          conversationsRef.current = nextConvs;
+          saveRatchetStateFromConversations(myBundle.userId, nextConvs);
         }
         setConversations((prev) => {
           const curr = prev[convId];
@@ -996,12 +1561,17 @@ export default function App() {
           };
         });
 
+        messagesRef.current = {
+          ...messagesRef.current,
+          [convId]: [...(messagesRef.current[convId] ?? []), message],
+        };
         setMessagesByConv((prev) => ({
           ...prev,
           [convId]: [...(prev[convId] ?? []), message],
         }));
         if (!threadRootId) setReplyTo(null);
-        requestAnimationFrame(() => setLastRenderMs(performance.now() - renderStart));
+
+        void saveMessageToVault(message);
 
         wsRef.current?.send(
           JSON.stringify({
@@ -1015,12 +1585,10 @@ export default function App() {
         const sk = conv.selfSenderKey ?? (await ensureRoomSenderKey(convId));
         if (!sk) return;
 
-        const t0 = performance.now();
         const { envelope, nextState } = await encryptGroupMessage(sk, text, {
           replyToId: activeReply?.id,
           threadRootId,
         });
-        setLastEncryptMs(performance.now() - t0);
 
         const message: ChatMessage = {
           id: envelope.id,
@@ -1044,24 +1612,21 @@ export default function App() {
           expiresAt,
         };
 
-        const renderStart = performance.now();
-        setWireLogs((prev) => [
-          {
-            id: `out_grp_${envelope.id}`,
-            protocol: 'SenderKey',
-            direction: 'outbound',
-            targetId: convId,
-            counter: envelope.iteration,
-            keyPreview: envelope.signatureB64.slice(0, 18),
-            ivB64: envelope.ivB64,
-            ciphertextPreview: envelope.ciphertextB64.slice(0, 44),
-            plaintextByteLength: envelope.plaintextByteLength,
-            paddedByteLength: envelope.paddedByteLength,
-            threadRootId: envelope.threadRootId,
-            timestamp: envelope.timestamp,
-          },
-          ...prev.slice(0, 49),
-        ]);
+        if (conversationsRef.current[convId]) {
+          const nextConvs = {
+            ...conversationsRef.current,
+            [convId]: {
+              ...conversationsRef.current[convId],
+              selfSenderKey: nextState,
+              lastMessagePreview: threadRootId
+                ? conversationsRef.current[convId].lastMessagePreview || text
+                : text,
+              lastMessageAt: envelope.timestamp,
+            },
+          };
+          conversationsRef.current = nextConvs;
+          saveRatchetStateFromConversations(myBundle.userId, nextConvs);
+        }
 
         setConversations((prev) => {
           const curr = prev[convId];
@@ -1079,12 +1644,17 @@ export default function App() {
           };
         });
 
+        messagesRef.current = {
+          ...messagesRef.current,
+          [convId]: [...(messagesRef.current[convId] ?? []), message],
+        };
         setMessagesByConv((prev) => ({
           ...prev,
           [convId]: [...(prev[convId] ?? []), message],
         }));
         if (!threadRootId) setReplyTo(null);
-        requestAnimationFrame(() => setLastRenderMs(performance.now() - renderStart));
+
+        void saveMessageToVault(message);
 
         wsRef.current?.send(
           JSON.stringify({
@@ -1096,7 +1666,7 @@ export default function App() {
         );
       }
     },
-    [replyTo, ensureDmSession, ensureRoomSenderKey, currentUserRole]
+    [replyTo, ensureDmSession, ensureRoomSenderKey, currentUserRole, saveMessageToVault]
   );
 
   const handleSendThreadReply = useCallback(
@@ -1106,92 +1676,152 @@ export default function App() {
     [handleSendMessage]
   );
 
-  const handleEditMessage = useCallback(async (messageId: string, newText: string) => {
-    const convId = activeIdRef.current;
-    setMessagesByConv((prev) => ({
-      ...prev,
-      [convId]: (prev[convId] ?? []).map((m) =>
+  const handleEditMessage = useCallback(
+    async (messageId: string, newText: string) => {
+      const convId = activeIdRef.current;
+      const conv = conversationsRef.current[convId];
+      const currList = messagesRef.current[convId] ?? [];
+      const nextList = currList.map((m) =>
         m.id === messageId ? { ...m, text: newText, isEdited: true } : m
-      ),
-    }));
-  }, []);
+      );
+      messagesRef.current = { ...messagesRef.current, [convId]: nextList };
+      setMessagesByConv((prev) => ({
+        ...prev,
+        [convId]: (prev[convId] ?? []).map((m) =>
+          m.id === messageId ? { ...m, text: newText, isEdited: true } : m
+        ),
+      }));
+      const updated = nextList.find((m) => m.id === messageId);
+      if (updated) void saveMessageToVault(updated);
+      wsRef.current?.send(
+        JSON.stringify({
+          type: 'msg:edit',
+          conversationId: convId,
+          kind: conv?.kind === 'dm' ? 'dm' : 'group',
+          messageId,
+          text: newText,
+        })
+      );
+    },
+    [saveMessageToVault]
+  );
 
-  const handleDeleteMessage = useCallback((messageId: string) => {
-    const convId = activeIdRef.current;
-    setMessagesByConv((prev) => ({
-      ...prev,
-      [convId]: (prev[convId] ?? []).map((m) =>
+  const handleDeleteMessage = useCallback(
+    (messageId: string) => {
+      const convId = activeIdRef.current;
+      const conv = conversationsRef.current[convId];
+      const currList = messagesRef.current[convId] ?? [];
+      const nextList = currList.map((m) =>
         m.id === messageId
           ? { ...m, isDeleted: true, text: 'Сообщение удалено' }
           : m
-      ),
-    }));
-    wsRef.current?.send(
-      JSON.stringify({ type: 'msg:delete', conversationId: convId, messageId })
-    );
-  }, []);
-
-  const handleTogglePin = useCallback((messageId: string) => {
-    const convId = activeIdRef.current;
-    let nextPinned = true;
-    setMessagesByConv((prev) => ({
-      ...prev,
-      [convId]: (prev[convId] ?? []).map((m) => {
-        if (m.id !== messageId) return m;
-        nextPinned = !m.isPinned;
-        return { ...m, isPinned: nextPinned };
-      }),
-    }));
-    wsRef.current?.send(
-      JSON.stringify({
-        type: 'msg:pin',
-        conversationId: convId,
-        messageId,
-        isPinned: nextPinned,
-      })
-    );
-  }, []);
-
-  const handleToggleReaction = useCallback((messageId: string, emoji: string) => {
-    const convId = activeIdRef.current;
-    const conv = conversationsRef.current[convId];
-    const myId = localBundleRef.current?.userId;
-    if (!myId || !conv) return;
-
-    const currentMsg = (messagesRef.current[convId] ?? []).find(
-      (m) => m.id === messageId
-    );
-    if (!currentMsg || currentMsg.isDeleted) return;
-
-    const { nextReactions, action } = toggleReaction(
-      currentMsg.reactions,
-      emoji,
-      myId
-    );
-
-    setMessagesByConv((prev) => {
-      const list = prev[convId];
-      if (!list) return prev;
-      return {
+      );
+      messagesRef.current = { ...messagesRef.current, [convId]: nextList };
+      setMessagesByConv((prev) => ({
         ...prev,
-        [convId]: list.map((m) =>
-          m.id === messageId ? { ...m, reactions: nextReactions } : m
+        [convId]: (prev[convId] ?? []).map((m) =>
+          m.id === messageId
+            ? { ...m, isDeleted: true, text: 'Сообщение удалено' }
+            : m
         ),
-      };
-    });
+      }));
+      const updated = nextList.find((m) => m.id === messageId);
+      if (updated) void saveMessageToVault(updated);
+      wsRef.current?.send(
+        JSON.stringify({
+          type: 'msg:delete',
+          conversationId: convId,
+          kind: conv?.kind === 'dm' ? 'dm' : 'group',
+          messageId,
+        })
+      );
+    },
+    [saveMessageToVault]
+  );
 
-    wsRef.current?.send(
-      JSON.stringify({
-        type: 'msg:reaction',
-        conversationId: convId,
-        kind: conv.kind === 'dm' ? 'dm' : 'group',
-        messageId,
+  const handleTogglePin = useCallback(
+    (messageId: string) => {
+      const convId = activeIdRef.current;
+      const conv = conversationsRef.current[convId];
+      const currList = messagesRef.current[convId] ?? [];
+      const target = currList.find((m) => m.id === messageId);
+      const nextPinned = target ? !target.isPinned : true;
+      const nextList = currList.map((m) =>
+        m.id === messageId ? { ...m, isPinned: nextPinned } : m
+      );
+      messagesRef.current = { ...messagesRef.current, [convId]: nextList };
+      setMessagesByConv((prev) => ({
+        ...prev,
+        [convId]: (prev[convId] ?? []).map((m) =>
+          m.id === messageId ? { ...m, isPinned: nextPinned } : m
+        ),
+      }));
+      const updated = nextList.find((m) => m.id === messageId);
+      if (updated) void saveMessageToVault(updated);
+      wsRef.current?.send(
+        JSON.stringify({
+          type: 'msg:pin',
+          conversationId: convId,
+          kind: conv?.kind === 'dm' ? 'dm' : 'group',
+          messageId,
+          isPinned: nextPinned,
+        })
+      );
+    },
+    [saveMessageToVault]
+  );
+
+  const handleToggleReaction = useCallback(
+    (messageId: string, emoji: string) => {
+      const convId = activeIdRef.current;
+      const conv = conversationsRef.current[convId];
+      const myId = localBundleRef.current?.userId;
+      if (!myId || !conv) return;
+
+      const currentMsg = (messagesRef.current[convId] ?? []).find(
+        (m) => m.id === messageId
+      );
+      if (!currentMsg || currentMsg.isDeleted) return;
+
+      const { nextReactions, action } = toggleReaction(
+        currentMsg.reactions,
         emoji,
-        userId: myId,
-        action,
-      })
-    );
-  }, []);
+        myId
+      );
+
+      const nextList = (messagesRef.current[convId] ?? []).map((m) =>
+        m.id === messageId ? { ...m, reactions: nextReactions } : m
+      );
+      messagesRef.current = { ...messagesRef.current, [convId]: nextList };
+
+      setMessagesByConv((prev) => {
+        const list = prev[convId];
+        if (!list) return prev;
+        return {
+          ...prev,
+          [convId]: list.map((m) =>
+            m.id === messageId ? { ...m, reactions: nextReactions } : m
+          ),
+        };
+      });
+
+      const updated = nextList.find((m) => m.id === messageId);
+      if (updated) void saveMessageToVault(updated);
+
+      wsRef.current?.send(
+        JSON.stringify({
+          type: 'msg:reaction',
+          conversationId: convId,
+          kind: conv.kind === 'dm' ? 'dm' : 'group',
+          messageId,
+          emoji,
+          userId: myId,
+          action,
+        })
+      );
+    },
+    [saveMessageToVault]
+  );
 
   const handleCreateRoom = useCallback(
     (payload: {
@@ -1261,6 +1891,38 @@ export default function App() {
     wsRef.current?.send(JSON.stringify({ type: 'presence:update', presence: p }));
   }, []);
 
+  const handleToggleDesktopNotifications = useCallback(async () => {
+    const currentPerm = getNotificationPermissionState();
+    setNotificationPermission(currentPerm);
+    if (currentPerm === 'unsupported') return;
+
+    if (currentPerm === 'default') {
+      const nextPerm = await requestDesktopNotificationPermission();
+      setNotificationPermission(nextPerm);
+      if (nextPerm === 'granted') {
+        setDesktopNotificationsEnabled(true);
+        try {
+          localStorage.setItem(DESKTOP_NOTIF_ENABLED_KEY, 'true');
+        } catch {
+          // ignore storage quota errors
+        }
+      }
+      return;
+    }
+
+    if (currentPerm === 'granted') {
+      setDesktopNotificationsEnabled((prev) => {
+        const next = !prev;
+        try {
+          localStorage.setItem(DESKTOP_NOTIF_ENABLED_KEY, String(next));
+        } catch {
+          // ignore storage quota errors
+        }
+        return next;
+      });
+    }
+  }, []);
+
   const handleToggleVerified = useCallback((id: string) => {
     setConversations((prev) => {
       const curr = prev[id];
@@ -1280,6 +1942,12 @@ export default function App() {
           myBundle,
           conv.bundle
         );
+        const nextConvs = {
+          ...conversationsRef.current,
+          [id]: { ...conversationsRef.current[id], session },
+        };
+        conversationsRef.current = nextConvs;
+        saveRatchetStateFromConversations(myBundle.userId, nextConvs);
         setConversations((prev) => ({
           ...prev,
           [id]: { ...prev[id], session },
@@ -1295,6 +1963,12 @@ export default function App() {
         );
       } else {
         const sk = await createSenderKeyState(id, myBundle.userId);
+        const nextConvs = {
+          ...conversationsRef.current,
+          [id]: { ...conversationsRef.current[id], selfSenderKey: sk },
+        };
+        conversationsRef.current = nextConvs;
+        saveRatchetStateFromConversations(myBundle.userId, nextConvs);
         setConversations((prev) => ({
           ...prev,
           [id]: { ...prev[id], selfSenderKey: sk },
@@ -1322,85 +1996,6 @@ export default function App() {
     highlightTimerRef.current = window.setTimeout(() => {
       setHighlightedMessageId(null);
     }, 2400);
-  }, []);
-
-  const handleRunBenchmark = useCallback(async (count: number) => {
-    const myId = localBundleRef.current?.userId ?? 'local';
-    const convId = activeIdRef.current;
-    const conv = conversationsRef.current[convId];
-    const isDm = conv?.kind === 'dm';
-
-    const samplePhrases = [
-      'Проверка пропускной способности Double Ratchet / SenderKey и виртуализации.',
-      'Синхронизация префиксных высот через бинарный поиск O(log N).',
-      'Пакет AES-256-GCM с выровненным буфером 128 байт доставлен.',
-      'Мемоизированный MessageItem исключил лишние ре-рендеры соседних строк.',
-    ];
-
-    const start = performance.now();
-    const batch: ChatMessage[] = new Array(count);
-    const baseTs = Date.now() - count * 1500;
-
-    for (let i = 0; i < count; i++) {
-      const own = i % 2 === 0;
-      const text = `${samplePhrases[i % samplePhrases.length]} [тест #${i + 1}]`;
-      batch[i] = {
-        id: `bench_${Date.now()}_${i}`,
-        conversationId: convId,
-        kind: isDm ? 'dm' : 'group',
-        senderId: own ? myId : 'peer-marcus',
-        senderName: own ? 'Вы' : 'Марк Волков',
-        text,
-        timestamp: baseTs + i * 1500,
-        status: 'read',
-        isBenchmark: true,
-        groupEnvelope: !isDm
-          ? {
-              id: `bench_g_${i}`,
-              roomId: convId,
-              senderId: own ? myId : 'peer-marcus',
-              keyId: 1,
-              iteration: i,
-              ivB64: 'BenchIV12Byte==',
-              ciphertextB64: 'BenchCiphertext==',
-              signatureB64: 'BenchSig==',
-              plaintextByteLength: text.length,
-              paddedByteLength: 128,
-              timestamp: baseTs + i * 1500,
-            }
-          : undefined,
-        dmEnvelope: isDm
-          ? {
-              id: `bench_d_${i}`,
-              senderId: own ? myId : convId,
-              receiverId: own ? convId : myId,
-              dhPublicB64: 'BBenchKey',
-              counter: i,
-              prevCounter: Math.max(0, i - 1),
-              ivB64: 'BenchIV12Byte==',
-              ciphertextB64: 'BenchCiphertext==',
-              plaintextByteLength: text.length,
-              paddedByteLength: 128,
-              timestamp: baseTs + i * 1500,
-            }
-          : undefined,
-      };
-    }
-
-    setMessagesByConv((prev) => ({
-      ...prev,
-      [convId]: [...(prev[convId] ?? []), ...batch],
-    }));
-
-    requestAnimationFrame(() => setLastRenderMs(performance.now() - start));
-  }, []);
-
-  const handleClearBenchmark = useCallback(() => {
-    const convId = activeIdRef.current;
-    setMessagesByConv((prev) => ({
-      ...prev,
-      [convId]: (prev[convId] ?? []).filter((m) => !m.isBenchmark),
-    }));
   }, []);
 
   const conversationList = useMemo(
@@ -1449,16 +2044,6 @@ export default function App() {
     [mainMessages]
   );
 
-  const perfMetrics: PerfMetrics = useMemo(
-    () => ({
-      totalMessages: activeMessages.length,
-      renderedDomNodes,
-      lastEncryptMs,
-      lastRenderMs,
-    }),
-    [activeMessages.length, renderedDomNodes, lastEncryptMs, lastRenderMs]
-  );
-
   const peerConversations = useMemo(
     () => conversationList.filter((c) => c.kind === 'dm'),
     [conversationList]
@@ -1486,8 +2071,128 @@ export default function App() {
     });
   }, [activeConversation, currentUserRole]);
 
+  const handleAuthenticated = useCallback(
+    ({ user, token }: { token: string; user: AuthUser }) => {
+      sessionStorage.setItem(AUTH_TOKEN_KEY, token);
+      sessionStorage.setItem(AUTH_USER_KEY, JSON.stringify(user));
+      setAuthToken(token);
+      setAuthError(null);
+      setSessionWarning(null);
+      setReauthError(null);
+      setReauthPassword('');
+      setCurrentUser(user);
+      setCurrentUserRole(user.role);
+      setIsSuspended(!user.isActive);
+      setViewMode('chat');
+      setActiveId('room-general');
+      setAuthLoading(false);
+    },
+    []
+  );
+
+  const handleRefreshSession = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!currentUser || !reauthPassword) return;
+      setReauthBusy(true);
+      setReauthError(null);
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            email: currentUser.email,
+            password: reauthPassword,
+          }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          token?: string;
+          user?: AuthUser;
+        };
+        if (!res.ok || !data.token || !data.user) {
+          throw new Error(data.error || 'Неверный пароль');
+        }
+        sessionStorage.setItem(AUTH_TOKEN_KEY, data.token);
+        sessionStorage.setItem(AUTH_USER_KEY, JSON.stringify(data.user));
+        setAuthToken(data.token);
+        setCurrentUser(data.user);
+        setCurrentUserRole(data.user.role);
+        setIsSuspended(!data.user.isActive);
+        setSessionWarning(null);
+        setReauthPassword('');
+        // Force clean WS reconnect with fresh token
+        wsRef.current?.close();
+        const refreshedBundle = await loadOrCreateIdentityBundle(data.user.userId);
+        localBundleRef.current = { ...refreshedBundle };
+        setLocalBundle({ ...refreshedBundle });
+      } catch (err) {
+        setReauthError(err instanceof Error ? err.message : 'Ошибка обновления сессии');
+      } finally {
+        setReauthBusy(false);
+      }
+    },
+    [currentUser, reauthPassword]
+  );
+
+  const handleLogout = useCallback(async () => {
+    const token = authTokenRef.current;
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      });
+    } catch {
+      // ignore network error on logout
+    }
+    sessionStorage.removeItem(AUTH_TOKEN_KEY);
+    sessionStorage.removeItem(AUTH_USER_KEY);
+    wsRef.current?.close();
+    wsRef.current = null;
+    localBundleRef.current = null;
+    vaultKeyRef.current = null;
+    pendingVaultSavesRef.current = [];
+    peerDirectoryRef.current = {};
+    conversationsRef.current = {};
+    messagesRef.current = {};
+    setLocalBundle(null);
+    setWsConnected(false);
+    setAuthToken(null);
+    setCurrentUser(null);
+    setSessionWarning(null);
+    setReauthPassword('');
+    setReauthError(null);
+    setConversations({});
+    setMessagesByConv({});
+    setActiveThreadRootId(null);
+    setMembersOpen(false);
+    setReplyTo(null);
+    setViewMode('chat');
+    setMobileShowChat(false);
+    setAuthError(null);
+  }, []);
+
   const showAdminPanel =
-    viewMode === 'admin' && canAccessAdminPanel(currentUserRole);
+    viewMode === 'admin' && canAccessManagementConsole(currentUserRole);
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen w-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-300 text-sm">
+        Проверка корпоративной сессии…
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthScreen
+        initialError={authError}
+        onAuthenticated={handleAuthenticated}
+      />
+    );
+  }
 
   return (
     <div className="h-screen w-screen overflow-hidden flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
@@ -1504,16 +2209,17 @@ export default function App() {
           onOpenAdminPanel={handleOpenAdminPanel}
           onOpenCreateRoom={() => setCreateRoomOpen(true)}
           onOpenChannelDirectory={() => setChannelDirectoryOpen(true)}
-          localUserId={localBundle?.userId ?? '…'}
-          localRegistrationId={localBundle?.registrationId ?? 0}
-          currentUserRole={currentUserRole}
+          currentUser={currentUser}
           enterprisePolicy={enterprisePolicy}
-          onSwitchRole={handleSwitchRole}
           presence={presence}
           onChangePresence={handleChangePresence}
+          onLogout={() => void handleLogout()}
           darkMode={darkMode}
           onToggleDarkMode={() => setDarkMode((d) => !d)}
           wsConnected={wsConnected}
+          notificationPermission={notificationPermission}
+          desktopNotificationsEnabled={desktopNotificationsEnabled}
+          onToggleDesktopNotifications={() => void handleToggleDesktopNotifications()}
         />
       </div>
 
@@ -1524,8 +2230,9 @@ export default function App() {
           } flex-1 min-w-0 h-full`}
         >
           <AdminPanel
-            localUserId={localBundle?.userId ?? 'admin'}
-            localUserName={`Администратор ${(localBundle?.userId ?? '').slice(-4).toUpperCase()}`}
+            authToken={authToken ?? ''}
+            localUserId={currentUser.userId}
+            localUserName={currentUser.name}
             currentUserRole={currentUserRole}
             onBackToChats={() => {
               setViewMode('chat');
@@ -1570,8 +2277,8 @@ export default function App() {
                     ? `${activeConversation.typingUsers[0]} печатает…`
                     : activeConversation.kind === 'dm'
                     ? activeConversation.verified
-                      ? 'Ключ подтверждён · X3DH + Double Ratchet'
-                      : 'Сквозное шифрование · Double Ratchet'
+                      ? 'Ключ подтверждён · Сквозное шифрование'
+                      : 'Сквозное шифрование'
                     : [
                         activeConversation.department || 'Корпоративный канал',
                         `${activeConversation.memberIds?.length ?? 0} уч.`,
@@ -1679,7 +2386,6 @@ export default function App() {
               type="button"
               onClick={() => {
                 setMembersOpen((v) => !v);
-                setInspectorOpen(false);
                 setActiveThreadRootId(null);
               }}
               aria-label="Участники переписки"
@@ -1693,33 +2399,6 @@ export default function App() {
               <Users className="w-4 h-4" />
               <span className="hidden lg:inline">Участники</span>
             </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setInspectorOpen((v) => !v);
-                setMembersOpen(false);
-                setActiveThreadRootId(null);
-              }}
-              aria-label={
-                inspectorOpen
-                  ? 'Закрыть инспектор шифрования'
-                  : 'Открыть инспектор шифрования'
-              }
-              aria-expanded={inspectorOpen}
-              className={`h-9 px-3 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
-                inspectorOpen
-                  ? 'bg-blue-600 border-blue-600 text-white'
-                  : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-900 text-slate-700 dark:text-slate-200'
-              }`}
-            >
-              {inspectorOpen ? (
-                <PanelRightClose className="w-4 h-4" />
-              ) : (
-                <PanelRightOpen className="w-4 h-4" />
-              )}
-              <span className="hidden sm:inline">Инспектор E2EE</span>
-            </button>
           </div>
 
           {/* Client-side Encrypted Search Popover */}
@@ -1731,7 +2410,7 @@ export default function App() {
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Локальный поиск по расшифрованному кэшу…"
+                  placeholder="Поиск по сообщениям…"
                   autoFocus
                   className="flex-1 bg-transparent text-xs text-slate-900 dark:text-slate-100 focus:outline-none"
                 />
@@ -1747,7 +2426,7 @@ export default function App() {
               <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
                 {!searchQuery.trim() ? (
                   <p className="p-4 text-xs text-slate-400 text-center">
-                    Введите запрос — поиск выполняется локально без отправки на сервер
+                    Введите запрос — поиск выполняется локально на вашем устройстве
                   </p>
                 ) : searchResults.length === 0 ? (
                   <p className="p-4 text-xs text-slate-400 text-center">
@@ -1815,6 +2494,44 @@ export default function App() {
           )}
         </header>
 
+        {sessionWarning && !isSuspended && (
+          <form
+            onSubmit={handleRefreshSession}
+            data-testid="session-refresh-banner"
+            className="px-4 sm:px-6 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-800 dark:text-amber-200"
+          >
+            <span className="font-medium">
+              {sessionWarning}
+              {reauthError ? ` · ${reauthError}` : ''}
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <input
+                type="password"
+                required
+                value={reauthPassword}
+                onChange={(e) => setReauthPassword(e.target.value)}
+                placeholder="Пароль для переподключения"
+                className="h-7 px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-800 text-xs text-slate-900 dark:text-slate-100 focus:outline-none focus:border-blue-600"
+              />
+              <button
+                type="submit"
+                disabled={reauthBusy}
+                className="h-7 px-3 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-medium whitespace-nowrap"
+              >
+                {reauthBusy ? 'Подключение…' : 'Обновить сессию'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setSessionWarning(null)}
+                aria-label="Скрыть уведомление"
+                className="p-1 text-amber-700 dark:text-amber-300 hover:text-amber-900"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </form>
+        )}
+
         {pinnedMessages.length > 0 && (
           <button
             type="button"
@@ -1850,7 +2567,6 @@ export default function App() {
           onDelete={handleDeleteMessage}
           onTogglePin={handleTogglePin}
           onToggleReaction={handleToggleReaction}
-          onRenderedNodesChange={setRenderedDomNodes}
         />
 
         <Composer
@@ -1901,19 +2617,6 @@ export default function App() {
               setMembersOpen(false);
               handleSelectConversation(peerId);
             }}
-          />
-        </div>
-      )}
-
-      {!showAdminPanel && inspectorOpen && (
-        <div className="fixed inset-0 z-40 md:static md:inset-auto flex justify-end bg-slate-950/40 md:bg-transparent">
-          <InspectorDrawer
-            open={inspectorOpen}
-            onClose={() => setInspectorOpen(false)}
-            wireLogs={wireLogs}
-            metrics={perfMetrics}
-            onRunBenchmark={handleRunBenchmark}
-            onClearBenchmark={handleClearBenchmark}
           />
         </div>
       )}
