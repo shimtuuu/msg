@@ -1,0 +1,6 @@
+{
+  "name": "CipherLine — E2EE Signal Messenger",
+  "description": "End-to-end encrypted real-time messenger implementing Signal Protocol (X3DH, Double Ratchet, AES-256-GCM, Safety Numbers) and a high-performance virtualized UI.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
